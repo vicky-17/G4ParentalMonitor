@@ -30,4 +30,7 @@ out/
 *.jks
 *.keystore
 google-services.json
-secrets.properties
+secrets.properties-e 
+# Environment files
+*.env
+*.env.*
