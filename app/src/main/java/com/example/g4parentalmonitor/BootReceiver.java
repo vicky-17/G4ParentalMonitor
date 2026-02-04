@@ -50,6 +50,11 @@ public class BootReceiver extends BroadcastReceiver {
                 Log.d(TAG, "Quick boot detected. Starting SyncService...");
                 startSyncService(context);
                 break;
+                
+            case "RESTART_SERVICE":
+                Log.d(TAG, "Service restart triggered. Starting SyncService...");
+                startSyncService(context);
+                break;
         }
     }
 
