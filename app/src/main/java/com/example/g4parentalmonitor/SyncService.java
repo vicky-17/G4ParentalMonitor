@@ -64,7 +64,10 @@ public class SyncService extends Service {
         // 3. Start notification monitor
         startNotificationMonitor();
         
-        Log.d("SyncService", "🚀 Service started successfully");
+        // 4. Schedule JobService for auto-restart protection
+        ServiceRestartJob.scheduleJob(this);
+        
+        Log.d("SyncService", "🚀 Service started successfully with auto-restart protection");
     }
 
     @Override
