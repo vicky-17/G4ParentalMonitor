@@ -13,6 +13,8 @@ import java.util.Map;
 
 public class UsageStatsHelper {
 
+    // File: app/src/main/java/com/example/g4parentalmonitor/UsageStatsHelper.java
+
     public static List<Map<String, Object>> getRecentAppUsage(Context context) {
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
         PackageManager pm = context.getPackageManager();
@@ -22,41 +24,46 @@ public class UsageStatsHelper {
         calendar.set(Calendar.HOUR_OF_DAY, 0);
         calendar.set(Calendar.MINUTE, 0);
         calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
         long startTime = calendar.getTimeInMillis();
 
-        // CHANGE: Use queryAndAggregateUsageStats instead of queryUsageStats(INTERVAL_DAILY).
-        // This fixes the issue where "high time" was reported because INTERVAL_DAILY
-        // might return intervals that overlap with yesterday or return duplicate entries.
-        // This method automatically merges data to fit the best interval for the range.
-        Map<String, UsageStats> usageStatsMap = usm.queryAndAggregateUsageStats(startTime, endTime);
+        // Use INTERVAL_DAILY to get explicit daily buckets
+        List<UsageStats> statsList = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startTime, endTime);
 
-        List<Map<String, Object>> appUsageList = new ArrayList<>();
-
-        if (usageStatsMap != null) {
-            for (UsageStats stats : usageStatsMap.values()) {
-                long totalTimeMs = stats.getTotalTimeInForeground();
-
-                if (totalTimeMs > 0) {
-                    try {
-                        ApplicationInfo appInfo = pm.getApplicationInfo(stats.getPackageName(), 0);
-                        Map<String, Object> appData = new HashMap<>();
-                        String appName = pm.getApplicationLabel(appInfo).toString();
-
-                        appData.put("appName", appName);
-                        appData.put("packageName", stats.getPackageName());
-                        appData.put("minutes", totalTimeMs / 1000 / 60);
-                        appData.put("category", "General");
-
-                        appUsageList.add(appData);
-                    } catch (PackageManager.NameNotFoundException ignored) {
-                        // Still include even if label is missing
-                        Map<String, Object> appData = new HashMap<>();
-                        appData.put("appName", stats.getPackageName());
-                        appData.put("packageName", stats.getPackageName());
-                        appData.put("minutes", totalTimeMs / 1000 / 60);
-                        appUsageList.add(appData);
+        Map<String, UsageStats> aggregatedStats = new HashMap<>();
+        if (statsList != null) {
+            for (UsageStats stats : statsList) {
+                // Filter: Only take the bucket that actually belongs to today
+                // This prevents "High Time" (yesterday's data) and "Low Time" (stale aggregates)
+                if (stats.getBeginTime() >= startTime || stats.getLastTimeUsed() >= startTime) {
+                    String pkg = stats.getPackageName();
+                    if (!aggregatedStats.containsKey(pkg) ||
+                            stats.getTotalTimeInForeground() > aggregatedStats.get(pkg).getTotalTimeInForeground()) {
+                        aggregatedStats.put(pkg, stats);
                     }
                 }
+            }
+        }
+
+        List<Map<String, Object>> appUsageList = new ArrayList<>();
+        for (UsageStats stats : aggregatedStats.values()) {
+            long totalTimeMs = stats.getTotalTimeInForeground();
+
+            if (totalTimeMs > 0) {
+                String packageName = stats.getPackageName();
+                String appName = packageName;
+                try {
+                    ApplicationInfo appInfo = pm.getApplicationInfo(packageName, 0);
+                    appName = pm.getApplicationLabel(appInfo).toString();
+                } catch (PackageManager.NameNotFoundException ignored) {}
+
+                Map<String, Object> appData = new HashMap<>();
+                appData.put("appName", appName);
+                appData.put("packageName", packageName);
+                // Use double or Math.ceil to avoid losing 59 seconds of usage every time
+                appData.put("minutes", (int) Math.ceil(totalTimeMs / 1000.0 / 60.0));
+                appData.put("category", "General");
+                appUsageList.add(appData);
             }
         }
         return appUsageList;
