@@ -288,15 +288,71 @@ public class SyncService extends Service {
         handler.removeCallbacks(configRunnable);
         handler.removeCallbacks(notificationMonitor);
         
-        Log.d("SyncService", "⚠️ Service destroyed. Will auto-restart...");
+        Log.d("SyncService", "⚠️ Service destroyed. Triggering auto-restart...");
         super.onDestroy();
         
-        // Attempt to restart service immediately
+        // Multiple restart strategies for maximum reliability
+        
+        // Strategy 1: Direct restart via Intent
         Intent restartIntent = new Intent(getApplicationContext(), SyncService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(restartIntent);
+            try {
+                getApplicationContext().startForegroundService(restartIntent);
+            } catch (Exception e) {
+                Log.e("SyncService", "Failed to restart via startForegroundService", e);
+            }
         } else {
-            startService(restartIntent);
+            getApplicationContext().startService(restartIntent);
+        }
+        
+        // Strategy 2: Use AlarmManager for delayed restart
+        scheduleServiceRestart();
+        
+        // Strategy 3: Ensure JobService is active
+        ServiceRestartJob.scheduleJob(getApplicationContext());
+    }
+    
+    /**
+     * Schedule service restart using AlarmManager
+     * This provides another layer of protection
+     */
+    private void scheduleServiceRestart() {
+        try {
+            android.app.AlarmManager alarmManager = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
+            Intent intent = new Intent(getApplicationContext(), BootReceiver.class);
+            intent.setAction("RESTART_SERVICE");
+            
+            android.app.PendingIntent pendingIntent = android.app.PendingIntent.getBroadcast(
+                getApplicationContext(),
+                0,
+                intent,
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M 
+                    ? android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                    : android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            );
+            
+            if (alarmManager != null) {
+                // Restart after 5 seconds
+                long restartTime = System.currentTimeMillis() + 5000;
+                
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setExactAndAllowWhileIdle(
+                        android.app.AlarmManager.RTC_WAKEUP,
+                        restartTime,
+                        pendingIntent
+                    );
+                } else {
+                    alarmManager.setExact(
+                        android.app.AlarmManager.RTC_WAKEUP,
+                        restartTime,
+                        pendingIntent
+                    );
+                }
+                
+                Log.d("SyncService", "✅ Scheduled restart via AlarmManager");
+            }
+        } catch (Exception e) {
+            Log.e("SyncService", "Failed to schedule AlarmManager restart", e);
         }
     }
 }
