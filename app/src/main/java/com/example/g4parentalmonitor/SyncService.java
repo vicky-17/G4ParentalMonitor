@@ -25,7 +25,8 @@ public class SyncService extends Service {
     private static final String BASE_URL = Constants.BASE_URL + "/api";
     private static final double DISTANCE_THRESHOLD_METERS = 5.0;
 
-    private static final long APP_SYNC_INTERVAL_MS = 60000; // 60000 = 1 minute, 300000 = 5 mins
+    // Configurable sync interval - always send data every 2 minutes
+    private static final long APP_SYNC_INTERVAL_MS = 120000; // 120000 = 2 minutes
 
     // --- HELPERS ---
     private LocationHelper locationHelper; // Imports location logic
@@ -39,27 +40,37 @@ public class SyncService extends Service {
     private final Gson gson = new Gson();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private PrefsManager prefs;
+    
+    // Notification management
+    private NotificationManager notificationManager;
+    private static final int NOTIFICATION_ID = 1;
 
     @Override
     public void onCreate() {
         super.onCreate();
         prefs = new PrefsManager(this);
         locationHelper = new LocationHelper(this); // Initialize the helper
+        notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
 
         // 1. Foreground Notification
         createNotificationChannel();
-        startForeground(1, buildNotification());
+        startForeground(NOTIFICATION_ID, buildNotification());
 
         // 2. Start All Sync Loops
         startConfigLoop();
         startLocationLoop();
         startAppUsageLoop();
+        
+        // 3. Start notification monitor
+        startNotificationMonitor();
+        
+        Log.d("SyncService", "🚀 Service started successfully");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(1, buildNotification());
-        return START_STICKY;
+        startForeground(NOTIFICATION_ID, buildNotification());
+        return START_STICKY; // Auto-restart if killed by system
     }
 
     // =========================================================
@@ -133,42 +144,23 @@ public class SyncService extends Service {
                 List<Map<String, Object>> currentApps = UsageStatsHelper.getRecentAppUsage(this);
                 if (currentApps.isEmpty()) return;
 
-                // 2. Smart Check: Did anything actually change?
-                boolean hasChanged = false;
-                for (Map<String, Object> app : currentApps) {
-                    String pkg = (String) app.get("packageName");
-                    long currentMins = (long) app.get("minutes");
+                // 2. ALWAYS send all app data (no change detection)
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("deviceId", deviceId);
+                payload.put("apps", currentApps);
 
-                    // Compare against local cache in PrefsManager
-                    if (currentMins > prefs.getLastSentAppMinutes(pkg)) {
-                        hasChanged = true;
-                        break;
+                RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
+                Request req = new Request.Builder().url(BASE_URL + "/apps").post(body).build();
+
+                try (Response res = client.newCall(req).execute()) {
+                    if (res.isSuccessful()) {
+                        Log.d("SyncService", "✅ All Apps Synced (" + currentApps.size() + " apps)");
+                    } else {
+                        Log.e("SyncService", "❌ Sync failed: " + res.code());
                     }
-                }
-
-                // 3. Only send if there is new data to report
-                if (hasChanged) {
-                    Map<String, Object> payload = new HashMap<>();
-                    payload.put("deviceId", deviceId);
-                    payload.put("apps", currentApps);
-
-                    RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
-                    Request req = new Request.Builder().url(BASE_URL + "/apps").post(body).build();
-
-                    try (Response res = client.newCall(req).execute()) {
-                        if (res.isSuccessful()) {
-                            Log.d("SyncService", "All Apps Synced ✅");
-                            // 4. Update cache ONLY after successful server confirmation
-                            for (Map<String, Object> app : currentApps) {
-                                prefs.saveAppUsageCache((String) app.get("packageName"), (long) app.get("minutes"));
-                            }
-                        }
-                    }
-                } else {
-                    Log.d("SyncService", "No app usage changes detected. Skipping sync.");
                 }
             } catch (Exception e) {
-                Log.e("SyncService", "App Sync Failed", e);
+                Log.e("SyncService", "❌ App Sync Failed", e);
             }
         }).start();
     }
@@ -218,21 +210,69 @@ public class SyncService extends Service {
     // --- NOTIFICATION SETUP ---
     private Notification buildNotification() {
         return new NotificationCompat.Builder(this, "g4_sync_channel")
-                .setContentTitle("G4 Monitor")
-                .setContentText("Syncing Data...")
-                .setSmallIcon(android.R.drawable.ic_popup_sync)
-                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .setContentTitle("Parent Control")
+                .setContentText("Parent control app is running in background")
+                .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setOngoing(true) // Make it persistent
+                .setAutoCancel(false) // Prevent dismissal
                 .build();
     }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    "g4_sync_channel", "G4 Sync Service", NotificationManager.IMPORTANCE_MIN
+                    "g4_sync_channel", 
+                    "Parent Control Service", 
+                    NotificationManager.IMPORTANCE_LOW
             );
+            channel.setDescription("Monitors app usage and location");
+            channel.setShowBadge(false);
+            channel.enableVibration(false);
+            channel.enableLights(false);
+            channel.setSound(null, null);
+            
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
         }
+    }
+    
+    // --- NOTIFICATION MONITOR (Re-show if cleared) ---
+    private final Runnable notificationMonitor = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                // Check if notification is still active
+                if (notificationManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    boolean notificationExists = false;
+                    
+                    android.service.notification.StatusBarNotification[] activeNotifications = 
+                        notificationManager.getActiveNotifications();
+                    
+                    for (android.service.notification.StatusBarNotification sbn : activeNotifications) {
+                        if (sbn.getId() == NOTIFICATION_ID) {
+                            notificationExists = true;
+                            break;
+                        }
+                    }
+                    
+                    // If notification was cleared, show it again
+                    if (!notificationExists) {
+                        Log.d("SyncService", "⚠️ Notification cleared. Re-showing...");
+                        notificationManager.notify(NOTIFICATION_ID, buildNotification());
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("SyncService", "Notification monitor error", e);
+            }
+            
+            // Check every 5 seconds
+            handler.postDelayed(this, 5000);
+        }
+    };
+    
+    private void startNotificationMonitor() {
+        handler.post(notificationMonitor);
     }
 
     @Override
@@ -243,6 +283,17 @@ public class SyncService extends Service {
         handler.removeCallbacks(locationRunnable);
         handler.removeCallbacks(appUsageRunnable);
         handler.removeCallbacks(configRunnable);
+        handler.removeCallbacks(notificationMonitor);
+        
+        Log.d("SyncService", "⚠️ Service destroyed. Will auto-restart...");
         super.onDestroy();
+        
+        // Attempt to restart service immediately
+        Intent restartIntent = new Intent(getApplicationContext(), SyncService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(restartIntent);
+        } else {
+            startService(restartIntent);
+        }
     }
 }
