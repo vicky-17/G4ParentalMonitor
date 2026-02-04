@@ -66,7 +66,10 @@ public class BootReceiver extends BroadcastReceiver {
                 context.startService(serviceIntent);
             }
             
-            Log.d(TAG, "✅ SyncService started successfully");
+            // Also schedule JobService for periodic checks
+            ServiceRestartJob.scheduleJob(context);
+            
+            Log.d(TAG, "✅ SyncService started successfully + JobService scheduled");
         } catch (Exception e) {
             Log.e(TAG, "❌ Failed to start SyncService", e);
         }
