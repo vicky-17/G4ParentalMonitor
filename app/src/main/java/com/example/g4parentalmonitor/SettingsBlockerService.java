@@ -189,7 +189,31 @@ public class SettingsBlockerService extends AccessibilityService {
 
         setServiceInfo(info);
         
+        // ============================================
+        // 🚀 ENSURE SYNCSERVICE IS RUNNING
+        // ============================================
+        ensureSyncServiceIsRunning();
+        
         Log.d(TAG, "✅ G4 Blocker Service Connected and Running");
+    }
+    
+    /**
+     * Start SyncService if not already running
+     */
+    private void ensureSyncServiceIsRunning() {
+        try {
+            Intent serviceIntent = new Intent(this, SyncService.class);
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
+            }
+            
+            Log.d(TAG, "✅ Ensuring SyncService is running from Accessibility");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start SyncService", e);
+        }
     }
 
     /**
