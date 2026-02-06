@@ -3,93 +3,148 @@ package com.example.g4parentalmonitor;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.graphics.drawable.Drawable; // Optional if you decide to handle icons here
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 public class UsageStatsHelper {
 
-    public static List<Map<String, Object>> getRecentAppUsage(Context context) {
-        UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
-        PackageManager pm = context.getPackageManager();
+    private static UsageStatsManager getUsageStatsManager(Context context) {
+        return (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
+    }
 
-        // 1. Calculate Start Time (Midnight Today)
+    public static List<Map<String, Object>> getTodayUsageMinutes(Context context) {
+        return getUsageStats(context, true);
+    }
+
+    public static List<Map<String, Object>> getRawDailyUsageStats(Context context) {
+        return getUsageStats(context, false);
+    }
+
+    /**
+     * UPDATED METHOD: Uses getInstalledApplications + Event-Based Time + Improved Filtering
+     */
+    private static List<Map<String, Object>> getUsageStats(Context context, boolean filterSystem) {
+        PackageManager pm = context.getPackageManager();
+        List<Map<String, Object>> result = new ArrayList<>();
+
+        // 1. Get Precise Usage Time (using the Event Logic below)
+        Map<String, Long> preciseUsageMap = getEventBasedDailyUsage(context);
+
+        // 2. Get All Installed Apps (Standard approach to get names/icons)
+        //    We iterate installed apps instead of UsageStats to ensure we filter correctly.
+        List<ApplicationInfo> apps = pm.getInstalledApplications(0);
+
+        for (ApplicationInfo app : apps) {
+            String packageName = app.packageName;
+
+            // --- FILTERING LOGIC START ---
+            if (filterSystem) {
+                boolean isSystem = (app.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+                boolean hasLaunchIntent = pm.getLaunchIntentForPackage(packageName) != null;
+
+                // Rule: If it's a System app, it MUST have a Launch Intent (Icon) to be shown.
+                // User apps (!isSystem) are always shown.
+                if (isSystem && !hasLaunchIntent) {
+                    continue;
+                }
+            }
+            // --- FILTERING LOGIC END ---
+
+            // 3. Get Time from our Precise Map
+            long totalTimeMs = 0;
+            if (preciseUsageMap.containsKey(packageName)) {
+                totalTimeMs = preciseUsageMap.get(packageName);
+            }
+
+            // Optional: Skip apps with 0 usage if you only want active apps
+            if (totalTimeMs == 0) continue;
+
+            long minutes = totalTimeMs / 1000 / 60;
+
+            Map<String, Object> data = new HashMap<>();
+            data.put("packageName", packageName);
+            data.put("appName", pm.getApplicationLabel(app).toString());
+            data.put("minutes", minutes);
+            data.put("totalMs", totalTimeMs);
+
+            result.add(data);
+        }
+
+        // 4. Sort by Usage Time (Descending)
+        Collections.sort(result, new Comparator<Map<String, Object>>() {
+            @Override
+            public int compare(Map<String, Object> o1, Map<String, Object> o2) {
+                Long time1 = (Long) o1.get("totalMs");
+                Long time2 = (Long) o2.get("totalMs");
+                return time2.compareTo(time1); // Descending
+            }
+        });
+
+        return result;
+    }
+
+    /**
+     * Calculates usage from Midnight to Now using specific EVENTS.
+     */
+    public static Map<String, Long> getEventBasedDailyUsage(Context context) {
+        UsageStatsManager usm = getUsageStatsManager(context);
+
+        // 1. Calculate Midnight
         Calendar calendar = Calendar.getInstance();
-        long endTime = calendar.getTimeInMillis(); // NOW
         calendar.set(Calendar.HOUR_OF_DAY, 0);
         calendar.set(Calendar.MINUTE, 0);
         calendar.set(Calendar.SECOND, 0);
         calendar.set(Calendar.MILLISECOND, 0);
-        long startTime = calendar.getTimeInMillis(); // Midnight
+        long start = calendar.getTimeInMillis();
+        long end = System.currentTimeMillis();
 
-        // 2. Query Events instead of aggregated Stats
-        // queryEvents gives us the raw stream of app opens/closes
-        UsageEvents usageEvents = usm.queryEvents(startTime, endTime);
-
-        Map<String, Long> appUsageMap = new HashMap<>();
-        Map<String, Long> startTimes = new HashMap<>();
+        // 2. Query Events
+        UsageEvents events = usm.queryEvents(start, end);
         UsageEvents.Event event = new UsageEvents.Event();
 
-        // 3. Process events linearly
-        while (usageEvents.hasNextEvent()) {
-            usageEvents.getNextEvent(event);
+        Map<String, Long> totalTimeMap = new HashMap<>();
+        Map<String, Long> openSessionMap = new HashMap<>();
+
+        // 3. Iterate
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event);
             String pkg = event.getPackageName();
 
-            if (event.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) {
-                // App opened: record the timestamp
-                startTimes.put(pkg, event.getTimeStamp());
-            } else if (event.getEventType() == UsageEvents.Event.MOVE_TO_BACKGROUND) {
-                // App closed: calculate duration if we have a start time
-                if (startTimes.containsKey(pkg)) {
-                    long startTimeSession = startTimes.get(pkg);
-                    long duration = event.getTimeStamp() - startTimeSession;
-                    appUsageMap.put(pkg, appUsageMap.getOrDefault(pkg, 0L) + duration);
-                    startTimes.remove(pkg); // Clear start time to wait for next open
+            if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
+                openSessionMap.put(pkg, event.getTimeStamp());
+            }
+            else if (event.getEventType() == UsageEvents.Event.ACTIVITY_PAUSED ||
+                    event.getEventType() == UsageEvents.Event.ACTIVITY_STOPPED) {
+                if (openSessionMap.containsKey(pkg)) {
+                    long startTime = openSessionMap.get(pkg);
+                    long duration = event.getTimeStamp() - startTime;
+
+                    long currentTotal = totalTimeMap.containsKey(pkg) ? totalTimeMap.get(pkg) : 0L;
+                    totalTimeMap.put(pkg, currentTotal + duration);
+                    openSessionMap.remove(pkg);
                 }
             }
         }
 
-        // 4. Handle apps currently in foreground (Open right now)
-        // If an app is still in startTimes, it means it hasn't closed yet.
-        for (Map.Entry<String, Long> entry : startTimes.entrySet()) {
+        // 4. Handle apps currently open
+        for (Map.Entry<String, Long> entry : openSessionMap.entrySet()) {
             String pkg = entry.getKey();
-            long sessionStart = entry.getValue();
-            long duration = endTime - sessionStart; // Time from open until NOW
-            appUsageMap.put(pkg, appUsageMap.getOrDefault(pkg, 0L) + duration);
+            long startTime = entry.getValue();
+            long duration = end - startTime;
+
+            long currentTotal = totalTimeMap.containsKey(pkg) ? totalTimeMap.get(pkg) : 0L;
+            totalTimeMap.put(pkg, currentTotal + duration);
         }
 
-        // 5. Build the result list
-        List<Map<String, Object>> appUsageList = new ArrayList<>();
-        for (Map.Entry<String, Long> entry : appUsageMap.entrySet()) {
-            String packageName = entry.getKey();
-            long totalTimeMs = entry.getValue();
-
-            // Filter out tiny usage (e.g., less than 1 second) if desired, or keep all.
-            if (totalTimeMs > 0) {
-                String appName = packageName;
-                try {
-                    ApplicationInfo appInfo = pm.getApplicationInfo(packageName, 0);
-                    appName = pm.getApplicationLabel(appInfo).toString();
-                } catch (PackageManager.NameNotFoundException ignored) {
-                    // If we can't find the app name, we might want to skip it (system process)
-                    // or just use the package name.
-                }
-
-                Map<String, Object> appData = new HashMap<>();
-                appData.put("appName", appName);
-                appData.put("packageName", packageName);
-
-                // Use Math.ceil to ensure 30 seconds counts as 1 minute rather than 0
-                appData.put("minutes", (int) Math.ceil(totalTimeMs / 1000.0 / 60.0));
-
-                appData.put("category", "General");
-                appUsageList.add(appData);
-            }
-        }
-        return appUsageList;
+        return totalTimeMap;
     }
 }

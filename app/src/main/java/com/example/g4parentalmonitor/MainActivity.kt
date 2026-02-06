@@ -44,10 +44,10 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-
-    // REMOVED: private val BASE_URL (Using Constants.APPS_URL now)
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -67,22 +67,20 @@ class MainActivity : ComponentActivity() {
         setContent { AppUI() }
     }
 
-    // REMOVED: onResume(). We handle updates inside AppUI now.
-
     @Composable
     fun AppUI() {
         val context = LocalContext.current
         val scrollState = rememberScrollState()
+        val usageScrollState = rememberScrollState()
+        val rawScrollState = rememberScrollState()
         val lifecycleOwner = LocalLifecycleOwner.current
 
         // --- AUTOMATIC REFRESH LOGIC ---
-        // This variable forces the UI to redraw when it changes
         var refreshTrigger by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
         DisposableEffect(lifecycleOwner) {
             val observer = LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_RESUME) {
-                    // When user comes back to the app, update this value to force a redraw
                     refreshTrigger = System.currentTimeMillis()
                 }
             }
@@ -91,10 +89,57 @@ class MainActivity : ComponentActivity() {
                 lifecycleOwner.lifecycle.removeObserver(observer)
             }
         }
-        // -------------------------------
+
+        var usageList by remember { mutableStateOf<List<AppUsageItem>>(emptyList()) }
+        var rawUsageList by remember { mutableStateOf<List<RawUsageItem>>(emptyList()) }
+        var lastUsageUpdatedAt by remember { mutableStateOf<Long?>(null) }
+        var showRaw by remember { mutableStateOf(false) }
+
+        LaunchedEffect(refreshTrigger) {
+            // 1. Get Usage Map
+            val realUsageMap = UsageStatsHelper.getEventBasedDailyUsage(context)
+            val pm = context.packageManager
+
+            // 2. Get All Installed Apps
+            val allApps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+
+            // 3. Apply Filtering Logic
+            val parsed = allApps.filter { app ->
+                val isSystem = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+
+                // Logic:
+                // 1. If it is NOT a system app (User app), keep it.
+                // 2. If it IS a system app, only keep it if it has a Launch Intent (has a logo/is openable).
+                !isSystem || pm.getLaunchIntentForPackage(app.packageName) != null
+            }.map { app ->
+                // Get usage from map, default to 0 if no events today
+                val totalMs = realUsageMap[app.packageName] ?: 0L
+                val minutes = totalMs / (1000 * 60)
+
+                AppUsageItem(
+                    name = pm.getApplicationLabel(app).toString(),
+                    packageName = app.packageName,
+                    minutes = minutes
+                )
+            }.sortedByDescending { it.minutes }
+
+            usageList = parsed
+
+            // Keep the raw debug view (optional)
+            val rawDaily = UsageStatsHelper.getRawDailyUsageStats(context)
+            val rawParsed = rawDaily.mapNotNull { item ->
+                val pkg = item["packageName"] as? String ?: return@mapNotNull null
+                val name = item["appName"] as? String ?: pkg
+                val minutes = (item["minutes"] as? Number)?.toLong() ?: 0L
+                val totalMs = (item["totalMs"] as? Number)?.toLong() ?: 0L
+                RawUsageItem(name = name, packageName = pkg, minutes = minutes, totalMs = totalMs)
+            }.sortedByDescending { it.minutes }
+            rawUsageList = rawParsed
+
+            lastUsageUpdatedAt = System.currentTimeMillis()
+        }
 
         G4ParentalMonitorTheme {
-            // key(refreshTrigger) ensures everything inside re-evaluates when we return
             key(refreshTrigger) {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Column(
@@ -132,7 +177,6 @@ class MainActivity : ComponentActivity() {
 
                         // --- BASIC PERMISSIONS ---
 
-                        // Check permissions (Re-runs every time refreshTrigger changes)
                         val isUsageGranted = hasUsageStatsPermission()
 
                         PermissionItem(
@@ -233,6 +277,145 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         )
+
+                        // --- LATEST APP USAGE (SCROLLABLE LIST) ---
+                        Spacer(modifier = Modifier.height(30.dp))
+                        HorizontalDivider(thickness = 1.dp, color = Color.LightGray)
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        Text("Latest App Usage", style = MaterialTheme.typography.titleLarge)
+                        Text("Sorted by highest usage today (All Apps).", color = Color.Gray, fontSize = 14.sp)
+
+                        val lastUpdatedText = lastUsageUpdatedAt?.let {
+                            SimpleDateFormat("hh:mm a", Locale.getDefault()).format(it)
+                        }
+                        if (lastUpdatedText != null) {
+                            Text("Updated $lastUpdatedText", color = Color.Gray, fontSize = 12.sp)
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        if (!isUsageGranted) {
+                            Text(
+                                "Usage Access permission is required to show app usage.",
+                                color = Color.Red,
+                                fontSize = 13.sp
+                            )
+                        } else if (usageList.isEmpty()) {
+                            Text("No usage data available yet.", color = Color.Gray, fontSize = 13.sp)
+                        } else {
+                            Text(
+                                "Showing ${usageList.size} apps. Scroll to see all.",
+                                color = Color.Gray,
+                                fontSize = 12.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 520.dp)
+                                    .verticalScroll(usageScrollState)
+                            ) {
+                                usageList.forEachIndexed { index, item ->
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 6.dp),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC))
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "${index + 1}.",
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 14.sp,
+                                                modifier = Modifier.width(28.dp)
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = item.name,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    fontSize = 14.sp
+                                                )
+                                                Text(
+                                                    text = item.packageName,
+                                                    color = Color.Gray,
+                                                    fontSize = 11.sp
+                                                )
+                                            }
+                                            Text(
+                                                text = "${item.minutes}m",
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 14.sp,
+                                                color = Color(0xFF2563EB)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(20.dp))
+                        TextButton(onClick = { showRaw = !showRaw }) {
+                            Text(if (showRaw) "Hide Raw Usage Data" else "Show Raw Usage Data")
+                        }
+
+                        if (showRaw) {
+                            Text(
+                                "Raw UsageStatsManager daily data (${rawUsageList.size} items).",
+                                color = Color.Gray,
+                                fontSize = 12.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 320.dp)
+                                    .verticalScroll(rawScrollState)
+                            ) {
+                                rawUsageList.forEach { item ->
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 4.dp),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9))
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = item.name,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    fontSize = 13.sp
+                                                )
+                                                Text(
+                                                    text = item.packageName,
+                                                    color = Color.Gray,
+                                                    fontSize = 10.sp
+                                                )
+                                            }
+                                            Column(horizontalAlignment = Alignment.End) {
+                                                Text(
+                                                    text = "${item.minutes}m",
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontSize = 12.sp,
+                                                    color = Color(0xFF0F172A)
+                                                )
+                                                Text(
+                                                    text = "${item.totalMs}ms",
+                                                    color = Color.Gray,
+                                                    fontSize = 10.sp
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -263,8 +446,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
-    // --- HELPER FUNCTIONS ---
 
     private fun hasUsageStatsPermission(): Boolean {
         val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
@@ -304,7 +485,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startMonitoringService() {
-        val serviceIntent = Intent(this, SyncService::class.java) // <--- Changed to SyncService
+        val serviceIntent = Intent(this, SyncService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)
         } else {
@@ -337,7 +518,6 @@ class MainActivity : ComponentActivity() {
         return false
     }
 
-    // --- UPLOAD DEVICE DATA (Using Constants) ---
     private fun uploadDeviceData() {
         val prefs = PrefsManager(this)
         val deviceId = prefs.deviceId ?: return
@@ -355,8 +535,8 @@ class MainActivity : ComponentActivity() {
                 val appObj = JSONObject()
                 appObj.put("appName", appInfo.loadLabel(pm).toString())
                 appObj.put("packageName", pkg.packageName)
-                appObj.put("minutes", 0)
-                appObj.put("lastTime", System.currentTimeMillis())
+                appObj.put("seconds", 0)
+                appObj.put("initialSync", true)
                 jsonArray.put(appObj)
             }
         }
@@ -368,7 +548,7 @@ class MainActivity : ComponentActivity() {
         val client = OkHttpClient()
         val body = jsonBody.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
         val request = Request.Builder()
-            .url(Constants.APPS_URL) // <--- Correctly using Constants
+            .url(Constants.APPS_URL)
             .post(body)
             .build()
 
@@ -393,3 +573,16 @@ class MainActivity : ComponentActivity() {
         })
     }
 }
+
+data class AppUsageItem(
+    val name: String,
+    val packageName: String,
+    val minutes: Long
+)
+
+data class RawUsageItem(
+    val name: String,
+    val packageName: String,
+    val minutes: Long,
+    val totalMs: Long
+)

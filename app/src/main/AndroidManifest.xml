@@ -12,6 +12,10 @@
     <uses-permission
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
+
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -42,7 +46,6 @@
             android:exported="false"
             android:foregroundServiceType="location|dataSync" />
 
-        <!-- Job Service for Auto-Restart -->
         <service
             android:name=".ServiceRestartJob"
             android:permission="android.permission.BIND_JOB_SERVICE"
@@ -78,7 +81,6 @@
             </intent-filter>
         </receiver>
 
-        <!-- Boot Receiver for Auto-Start -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"

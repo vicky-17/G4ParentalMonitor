@@ -29,8 +29,7 @@ public class SyncService extends Service {
     private static final long APP_SYNC_INTERVAL_MS = 120000; // 120000 = 2 minutes
 
     // --- HELPERS ---
-    private LocationHelper locationHelper; // Imports location logic
-    // UsageStatsHelper is static, so we don't need to instantiate it
+    private LocationHelper locationHelper;
 
     // --- NETWORK & TOOLS ---
     private final OkHttpClient client = new OkHttpClient.Builder()
@@ -40,7 +39,7 @@ public class SyncService extends Service {
     private final Gson gson = new Gson();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private PrefsManager prefs;
-    
+
     // Notification management
     private NotificationManager notificationManager;
     private static final int NOTIFICATION_ID = 1;
@@ -49,31 +48,28 @@ public class SyncService extends Service {
     public void onCreate() {
         super.onCreate();
         prefs = new PrefsManager(this);
-        locationHelper = new LocationHelper(this); // Initialize the helper
+        locationHelper = new LocationHelper(this);
         notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
 
-        // 1. Foreground Notification
+        // Removed: usage sync time initialization (we do not store usage data locally anymore)
+
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification());
 
-        // 2. Start All Sync Loops
         startConfigLoop();
         startLocationLoop();
         startAppUsageLoop();
-        
-        // 3. Start notification monitor
+
         startNotificationMonitor();
-        
-        // 4. Schedule JobService for auto-restart protection
         ServiceRestartJob.scheduleJob(this);
-        
+
         Log.d("SyncService", "🚀 Service started successfully with auto-restart protection");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         startForeground(NOTIFICATION_ID, buildNotification());
-        return START_STICKY; // Auto-restart if killed by system
+        return START_STICKY;
     }
 
     // =========================================================
@@ -82,13 +78,10 @@ public class SyncService extends Service {
     private final Runnable locationRunnable = new Runnable() {
         @Override
         public void run() {
-            // Ask Helper for Location
             locationHelper.fetchCurrentLocation(location -> {
-                // When location is found, send it
                 sendLocationData(location);
             });
 
-            // Schedule next run (Battery Aware)
             long interval = (getBatteryLevel() < 15) ? (30 * 60 * 1000) : 45000;
             handler.postDelayed(this, interval);
         }
@@ -100,10 +93,9 @@ public class SyncService extends Service {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
-                // Distance Filter
                 if (prefs.hasLastSentLocation()) {
                     double dist = calculateDistance(prefs.getLastSentLatitude(), prefs.getLastSentLongitude(), loc.getLatitude(), loc.getLongitude());
-                    if (dist < DISTANCE_THRESHOLD_METERS) return; // Didn't move enough
+                    if (dist < DISTANCE_THRESHOLD_METERS) return;
                 }
 
                 Map<String, Object> data = new HashMap<>();
@@ -132,7 +124,6 @@ public class SyncService extends Service {
         @Override
         public void run() {
             syncApps();
-            // CHANGE THIS LINE:
             handler.postDelayed(this, APP_SYNC_INTERVAL_MS);
         }
     };
@@ -143,11 +134,14 @@ public class SyncService extends Service {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
-                // 1. Get ALL apps from helper
-                List<Map<String, Object>> currentApps = UsageStatsHelper.getRecentAppUsage(this);
-                if (currentApps.isEmpty()) return;
+                // 1. Get absolute "today" app usage (minutes) DIRECTLY from System
+                // We do NOT use any local storage or caching here.
+                List<Map<String, Object>> currentApps =
+                        UsageStatsHelper.getTodayUsageMinutes(this);
 
-                // 2. ALWAYS send all app data (no change detection)
+                if (currentApps == null || currentApps.isEmpty()) return;
+
+                // 2. Send data
                 Map<String, Object> payload = new HashMap<>();
                 payload.put("deviceId", deviceId);
                 payload.put("apps", currentApps);
@@ -157,7 +151,8 @@ public class SyncService extends Service {
 
                 try (Response res = client.newCall(req).execute()) {
                     if (res.isSuccessful()) {
-                        Log.d("SyncService", "✅ All Apps Synced (" + currentApps.size() + " apps)");
+                        Log.d("SyncService", "✅ Apps Synced (" + currentApps.size() + ")");
+                        // Removed: prefs.setLastUsageSyncTime(...)
                     } else {
                         Log.e("SyncService", "❌ Sync failed: " + res.code());
                     }
@@ -175,7 +170,7 @@ public class SyncService extends Service {
         @Override
         public void run() {
             syncSettings();
-            handler.postDelayed(this, 60000); // Every 1 min
+            handler.postDelayed(this, 60000);
         }
     };
 
@@ -217,16 +212,16 @@ public class SyncService extends Service {
                 .setContentText("Parent control app is running in background")
                 .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
-                .setOngoing(true) // Make it persistent
-                .setAutoCancel(false) // Prevent dismissal
+                .setOngoing(true)
+                .setAutoCancel(false)
                 .build();
     }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    "g4_sync_channel", 
-                    "Parent Control Service", 
+                    "g4_sync_channel",
+                    "Parent Control Service",
                     NotificationManager.IMPORTANCE_LOW
             );
             channel.setDescription("Monitors app usage and location");
@@ -234,32 +229,28 @@ public class SyncService extends Service {
             channel.enableVibration(false);
             channel.enableLights(false);
             channel.setSound(null, null);
-            
+
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
         }
     }
-    
-    // --- NOTIFICATION MONITOR (Re-show if cleared) ---
+
+    // --- NOTIFICATION MONITOR ---
     private final Runnable notificationMonitor = new Runnable() {
         @Override
         public void run() {
             try {
-                // Check if notification is still active
                 if (notificationManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     boolean notificationExists = false;
-                    
-                    android.service.notification.StatusBarNotification[] activeNotifications = 
-                        notificationManager.getActiveNotifications();
-                    
+                    android.service.notification.StatusBarNotification[] activeNotifications =
+                            notificationManager.getActiveNotifications();
+
                     for (android.service.notification.StatusBarNotification sbn : activeNotifications) {
                         if (sbn.getId() == NOTIFICATION_ID) {
                             notificationExists = true;
                             break;
                         }
                     }
-                    
-                    // If notification was cleared, show it again
                     if (!notificationExists) {
                         Log.d("SyncService", "⚠️ Notification cleared. Re-showing...");
                         notificationManager.notify(NOTIFICATION_ID, buildNotification());
@@ -268,12 +259,10 @@ public class SyncService extends Service {
             } catch (Exception e) {
                 Log.e("SyncService", "Notification monitor error", e);
             }
-            
-            // Check every 5 seconds
             handler.postDelayed(this, 5000);
         }
     };
-    
+
     private void startNotificationMonitor() {
         handler.post(notificationMonitor);
     }
@@ -287,13 +276,10 @@ public class SyncService extends Service {
         handler.removeCallbacks(appUsageRunnable);
         handler.removeCallbacks(configRunnable);
         handler.removeCallbacks(notificationMonitor);
-        
+
         Log.d("SyncService", "⚠️ Service destroyed. Triggering auto-restart...");
         super.onDestroy();
-        
-        // Multiple restart strategies for maximum reliability
-        
-        // Strategy 1: Direct restart via Intent
+
         Intent restartIntent = new Intent(getApplicationContext(), SyncService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
@@ -304,52 +290,37 @@ public class SyncService extends Service {
         } else {
             getApplicationContext().startService(restartIntent);
         }
-        
-        // Strategy 2: Use AlarmManager for delayed restart
+
         scheduleServiceRestart();
-        
-        // Strategy 3: Ensure JobService is active
         ServiceRestartJob.scheduleJob(getApplicationContext());
     }
-    
-    /**
-     * Schedule service restart using AlarmManager
-     * This provides another layer of protection
-     */
+
     private void scheduleServiceRestart() {
         try {
             android.app.AlarmManager alarmManager = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
             Intent intent = new Intent(getApplicationContext(), BootReceiver.class);
             intent.setAction("RESTART_SERVICE");
-            
+
             android.app.PendingIntent pendingIntent = android.app.PendingIntent.getBroadcast(
-                getApplicationContext(),
-                0,
-                intent,
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M 
-                    ? android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT
-                    : android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                    getApplicationContext(),
+                    0,
+                    intent,
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                            ? android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                            : android.app.PendingIntent.FLAG_UPDATE_CURRENT
             );
-            
+
             if (alarmManager != null) {
-                // Restart after 5 seconds
                 long restartTime = System.currentTimeMillis() + 5000;
-                
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     alarmManager.setExactAndAllowWhileIdle(
-                        android.app.AlarmManager.RTC_WAKEUP,
-                        restartTime,
-                        pendingIntent
+                            android.app.AlarmManager.RTC_WAKEUP, restartTime, pendingIntent
                     );
                 } else {
                     alarmManager.setExact(
-                        android.app.AlarmManager.RTC_WAKEUP,
-                        restartTime,
-                        pendingIntent
+                            android.app.AlarmManager.RTC_WAKEUP, restartTime, pendingIntent
                     );
                 }
-                
-                Log.d("SyncService", "✅ Scheduled restart via AlarmManager");
             }
         } catch (Exception e) {
             Log.e("SyncService", "Failed to schedule AlarmManager restart", e);
