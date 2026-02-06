@@ -1,6 +1,5 @@
 package com.example.g4parentalmonitor;
 
-import android.app.Service;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -22,17 +21,17 @@ import java.util.concurrent.TimeUnit;
 import org.json.JSONObject;
 import org.json.JSONArray;
 
-
-
 public class SyncService extends Service {
 
     // --- CONFIG ---
+    // Ensure Constants.BASE_URL is your server IP (e.g. http://192.168.1.5:3000)
     private static final String BASE_URL = Constants.BASE_URL + "/api";
-    private static final double DISTANCE_THRESHOLD_METERS = 1.0;
+    private static final double DISTANCE_THRESHOLD_METERS = 5.0;
 
-    // Configurable sync interval - always send data every 2 minutes
+    // Configurable sync intervals
     private static final long APP_SYNC_INTERVAL_MS = 120000; // 2 minutes
-    private static final long BROWSER_SYNC_INTERVAL_MS = 30000; // Check for new URLs every 30 seconds
+    private static final long BROWSER_SYNC_INTERVAL_MS = 30000; // 30 seconds
+    private static final long BLOCKED_SYNC_INTERVAL_MS = 120000; // 2 minutes
 
     // --- HELPERS ---
     private LocationHelper locationHelper;
@@ -60,16 +59,17 @@ public class SyncService extends Service {
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification());
 
+        // Start all monitoring loops
         startConfigLoop();
         startLocationLoop();
         startAppUsageLoop();
-        startBrowserSyncLoop(); // <--- Added this
+        startBrowserSyncLoop();
+        startBlockedAppsSyncLoop(); // <--- Added Blocking List Sync
 
         startNotificationMonitor();
         ServiceRestartJob.scheduleJob(this);
-        startBlockedAppsSyncLoop();
 
-        Log.d("SyncService", "🚀 Service started successfully with auto-restart protection");
+        Log.d("SyncService", "🚀 Service started successfully");
     }
 
     @Override
@@ -163,7 +163,7 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 🌐 3. BROWSER HISTORY SYNC LOOP (NEW)
+    // 🌐 3. BROWSER HISTORY SYNC LOOP
     // =========================================================
     private final Runnable browserSyncRunnable = new Runnable() {
         @Override
@@ -178,35 +178,26 @@ public class SyncService extends Service {
             try {
                 List<String> urlsToSend;
 
-                // 1. Safely retrieve and clear the list from SettingsBlockerService
-                // Ensure SettingsBlockerService.visitedUrls is public static in that file
+                // Retrieve data from SettingsBlockerService
                 synchronized (SettingsBlockerService.visitedUrls) {
                     if (SettingsBlockerService.visitedUrls.isEmpty()) return;
-
-                    // Create a copy to send
                     urlsToSend = new ArrayList<>(SettingsBlockerService.visitedUrls);
-                    // Clear the original list so we don't send duplicates
                     SettingsBlockerService.visitedUrls.clear();
                 }
 
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
-                // 2. Prepare JSON payload
                 Map<String, Object> payload = new HashMap<>();
                 payload.put("deviceId", deviceId);
-                payload.put("history", urlsToSend); // Array of "url|timestamp" strings
+                payload.put("history", urlsToSend);
 
-                // 3. Send to Server
                 RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
                 Request req = new Request.Builder().url(BASE_URL + "/browser-history").post(body).build();
 
                 try (Response res = client.newCall(req).execute()) {
                     if (res.isSuccessful()) {
                         Log.d("SyncService", "✅ Browser History Synced (" + urlsToSend.size() + ")");
-                    } else {
-                        Log.e("SyncService", "❌ History Sync failed: " + res.code());
-                        // Optional: Could add items back to list if failed, but risky for infinite loops
                     }
                 }
             } catch (Exception e) {
@@ -216,7 +207,54 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // ⚙️ 4. SETTINGS SYNC LOOP
+    // 🚫 4. BLOCKED APPS SYNC LOOP (Every 2 Minutes)
+    // =========================================================
+    private final Runnable blockedAppsRunnable = new Runnable() {
+        @Override
+        public void run() {
+            syncBlockedApps();
+            handler.postDelayed(this, BLOCKED_SYNC_INTERVAL_MS);
+        }
+    };
+
+    private void syncBlockedApps() {
+        new Thread(() -> {
+            try {
+                String deviceId = prefs.getDeviceId();
+                if (deviceId == null) return;
+
+                // Request blocked list from Server
+                Request req = new Request.Builder()
+                        .url(BASE_URL + "/rules/blocked/" + deviceId) // Endpoint: /api/rules/blocked/:id
+                        .get()
+                        .build();
+
+                try (Response res = client.newCall(req).execute()) {
+                    if (res.isSuccessful() && res.body() != null) {
+                        String jsonStr = res.body().string();
+                        JSONObject json = new JSONObject(jsonStr);
+                        JSONArray array = json.optJSONArray("blockedPackages");
+
+                        List<String> blockedList = new ArrayList<>();
+                        if (array != null) {
+                            for (int i = 0; i < array.length(); i++) {
+                                blockedList.add(array.getString(i));
+                            }
+                        }
+
+                        // Save to Local Storage for SettingsBlockerService to use
+                        prefs.saveBlockedPackages(blockedList);
+                        Log.d("SyncService", "🚫 Blocked Apps Updated: " + blockedList.size());
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("SyncService", "❌ Blocked Apps Sync Failed", e);
+            }
+        }).start();
+    }
+
+    // =========================================================
+    // ⚙️ 5. SETTINGS SYNC LOOP
     // =========================================================
     private final Runnable configRunnable = new Runnable() {
         @Override
@@ -241,7 +279,9 @@ public class SyncService extends Service {
     private void startLocationLoop() { handler.post(locationRunnable); }
     private void startAppUsageLoop() { handler.post(appUsageRunnable); }
     private void startConfigLoop() { handler.post(configRunnable); }
-    private void startBrowserSyncLoop() { handler.post(browserSyncRunnable); } // <--- Added this
+    private void startBrowserSyncLoop() { handler.post(browserSyncRunnable); }
+    private void startBlockedAppsSyncLoop() { handler.post(blockedAppsRunnable); }
+    private void startNotificationMonitor() { handler.post(notificationMonitor); }
 
     private int getBatteryLevel() {
         BatteryManager bm = (BatteryManager) getSystemService(BATTERY_SERVICE);
@@ -288,7 +328,6 @@ public class SyncService extends Service {
         }
     }
 
-    // --- NOTIFICATION MONITOR ---
     private final Runnable notificationMonitor = new Runnable() {
         @Override
         public void run() {
@@ -316,10 +355,6 @@ public class SyncService extends Service {
         }
     };
 
-    private void startNotificationMonitor() {
-        handler.post(notificationMonitor);
-    }
-
     @Override
     public IBinder onBind(Intent intent) { return null; }
 
@@ -329,7 +364,8 @@ public class SyncService extends Service {
         handler.removeCallbacks(appUsageRunnable);
         handler.removeCallbacks(configRunnable);
         handler.removeCallbacks(notificationMonitor);
-        handler.removeCallbacks(browserSyncRunnable); // <--- Added this
+        handler.removeCallbacks(browserSyncRunnable);
+        handler.removeCallbacks(blockedAppsRunnable);
 
         Log.d("SyncService", "⚠️ Service destroyed. Triggering auto-restart...");
         super.onDestroy();
@@ -345,91 +381,7 @@ public class SyncService extends Service {
             getApplicationContext().startService(restartIntent);
         }
 
-        scheduleServiceRestart();
+        // Also trigger via AlarmManager for reliability
         ServiceRestartJob.scheduleJob(getApplicationContext());
     }
-
-    private void scheduleServiceRestart() {
-        try {
-            android.app.AlarmManager alarmManager = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
-            Intent intent = new Intent(getApplicationContext(), BootReceiver.class);
-            intent.setAction("RESTART_SERVICE");
-
-            android.app.PendingIntent pendingIntent = android.app.PendingIntent.getBroadcast(
-                    getApplicationContext(),
-                    0,
-                    intent,
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                            ? android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT
-                            : android.app.PendingIntent.FLAG_UPDATE_CURRENT
-            );
-
-            if (alarmManager != null) {
-                long restartTime = System.currentTimeMillis() + 5000;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    alarmManager.setExactAndAllowWhileIdle(
-                            android.app.AlarmManager.RTC_WAKEUP, restartTime, pendingIntent
-                    );
-                } else {
-                    alarmManager.setExact(
-                            android.app.AlarmManager.RTC_WAKEUP, restartTime, pendingIntent
-                    );
-                }
-            }
-        } catch (Exception e) {
-            Log.e("SyncService", "Failed to schedule AlarmManager restart", e);
-        }
-    }
-
-
-    // =========================================================
-    // 🚫 4. BLOCKED APPS SYNC LOOP (Every 2 Minutes)
-    // =========================================================
-    private final Runnable blockedAppsRunnable = new Runnable() {
-        @Override
-        public void run() {
-            syncBlockedApps();
-            handler.postDelayed(this, 120000); // Run every 2 minutes
-        }
-    };
-
-    private void syncBlockedApps() {
-        new Thread(() -> {
-            try {
-                String deviceId = prefs.getDeviceId();
-                if (deviceId == null) return;
-
-                // Call the new Server Endpoint
-                Request req = new Request.Builder()
-                        .url(Constants.BASE_URL + "/api/rules/blocked/" + deviceId)
-                        .get()
-                        .build();
-
-                try (Response res = client.newCall(req).execute()) {
-                    if (res.isSuccessful() && res.body() != null) {
-                        String jsonStr = res.body().string();
-                        JSONObject json = new JSONObject(jsonStr);
-                        JSONArray array = json.optJSONArray("blockedPackages");
-
-                        List<String> blockedList = new ArrayList<>();
-                        if (array != null) {
-                            for (int i = 0; i < array.length(); i++) {
-                                blockedList.add(array.getString(i));
-                            }
-                        }
-
-                        // Save to Local Storage
-                        prefs.saveBlockedPackages(blockedList);
-                        Log.d("SyncService", "🚫 Blocked Apps Updated: " + blockedList.size());
-                    }
-                }
-            } catch (Exception e) {
-                Log.e("SyncService", "❌ Blocked Apps Sync Failed", e);
-            }
-        }).start();
-    }
-
-    private void startBlockedAppsSyncLoop() { handler.post(blockedAppsRunnable); }
-
-
 }
