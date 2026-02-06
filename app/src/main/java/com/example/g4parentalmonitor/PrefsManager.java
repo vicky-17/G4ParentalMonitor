@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.HashSet;
 
-
 public class PrefsManager {
     private static final String PREF_NAME = "G4Prefs";
     private SharedPreferences prefs;
@@ -74,8 +73,6 @@ public class PrefsManager {
         return prefs.contains("lastSentLat") && prefs.contains("lastSentLng");
     }
 
-
-
     // --- BLOCKED APPS STORAGE ---
     // We use a Set for O(1) fast lookup in the accessibility service
     public void saveBlockedPackages(List<String> packageNames) {
@@ -88,7 +85,7 @@ public class PrefsManager {
         return set.contains(packageName);
     }
 
-    // --- BLOCKED LISTS ---
+    // --- BLOCKED LISTS (Legacy - Keep if needed elsewhere) ---
     public void saveBlockedLists(List<String> apps, List<String> urls) {
         String appsJson = gson.toJson(apps);
         String urlsJson = gson.toJson(urls);

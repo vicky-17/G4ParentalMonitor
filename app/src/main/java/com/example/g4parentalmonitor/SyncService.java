@@ -24,14 +24,13 @@ import org.json.JSONArray;
 public class SyncService extends Service {
 
     // --- CONFIG ---
-    // Ensure Constants.BASE_URL is your server IP (e.g. http://192.168.1.5:3000)
     private static final String BASE_URL = Constants.BASE_URL + "/api";
     private static final double DISTANCE_THRESHOLD_METERS = 5.0;
 
     // Configurable sync intervals
-    private static final long APP_SYNC_INTERVAL_MS = 120000; // 2 minutes
-    private static final long BROWSER_SYNC_INTERVAL_MS = 30000; // 30 seconds
-    private static final long BLOCKED_SYNC_INTERVAL_MS = 120000; // 2 minutes
+    private static final long APP_SYNC_INTERVAL_MS = 60000;      // 1 Minute
+    private static final long BLOCKED_SYNC_INTERVAL_MS = 60000;  // 1 Minute (Requested)
+    private static final long BROWSER_SYNC_INTERVAL_MS = 30000;  // 30 Seconds
 
     // --- HELPERS ---
     private LocationHelper locationHelper;
@@ -64,12 +63,12 @@ public class SyncService extends Service {
         startLocationLoop();
         startAppUsageLoop();
         startBrowserSyncLoop();
-        startBlockedAppsSyncLoop(); // <--- Added Blocking List Sync
+        startBlockedAppsSyncLoop(); // <--- Critical: Starts the blocking update loop
 
         startNotificationMonitor();
         ServiceRestartJob.scheduleJob(this);
 
-        Log.d("SyncService", "🚀 Service started successfully");
+        Log.d("SyncService", "🚀 Service Started: Blocked Apps will sync every 60s");
     }
 
     @Override
@@ -79,91 +78,55 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 📍 1. LOCATION SYNC LOOP
+    // 🚫 1. BLOCKED APPS SYNC (Get list from Server)
     // =========================================================
-    private final Runnable locationRunnable = new Runnable() {
+    private final Runnable blockedAppsRunnable = new Runnable() {
         @Override
         public void run() {
-            locationHelper.fetchCurrentLocation(location -> {
-                sendLocationData(location);
-            });
-            long interval = (getBatteryLevel() < 15) ? (30 * 60 * 1000) : 45000;
-            handler.postDelayed(this, interval);
+            syncBlockedApps();
+            handler.postDelayed(this, BLOCKED_SYNC_INTERVAL_MS);
         }
     };
 
-    private void sendLocationData(Location loc) {
+    private void syncBlockedApps() {
         new Thread(() -> {
             try {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
-                if (prefs.hasLastSentLocation()) {
-                    double dist = calculateDistance(prefs.getLastSentLatitude(), prefs.getLastSentLongitude(), loc.getLatitude(), loc.getLongitude());
-                    if (dist < DISTANCE_THRESHOLD_METERS) return;
-                }
-
-                Map<String, Object> data = new HashMap<>();
-                data.put("deviceId", deviceId);
-                data.put("latitude", loc.getLatitude());
-                data.put("longitude", loc.getLongitude());
-                data.put("batteryLevel", getBatteryLevel());
-
-                RequestBody body = RequestBody.create(gson.toJson(data), MediaType.get("application/json"));
-                Request req = new Request.Builder().url(BASE_URL + "/location").post(body).build();
+                Request req = new Request.Builder()
+                        .url(BASE_URL + "/rules/blocked/" + deviceId)
+                        .get()
+                        .build();
 
                 try (Response res = client.newCall(req).execute()) {
-                    if (res.isSuccessful()) {
-                        prefs.saveLastSentLocation(loc.getLatitude(), loc.getLongitude());
-                        Log.d("SyncService", "Location Sent ✅");
-                    }
-                }
-            } catch (Exception e) { Log.e("SyncService", "Loc Send Failed", e); }
-        }).start();
-    }
+                    if (res.isSuccessful() && res.body() != null) {
+                        String jsonStr = res.body().string();
+                        JSONObject json = new JSONObject(jsonStr);
+                        JSONArray array = json.optJSONArray("blockedPackages");
 
-    // =========================================================
-    // 📱 2. APP USAGE SYNC LOOP
-    // =========================================================
-    private final Runnable appUsageRunnable = new Runnable() {
-        @Override
-        public void run() {
-            syncApps();
-            handler.postDelayed(this, APP_SYNC_INTERVAL_MS);
-        }
-    };
+                        List<String> blockedList = new ArrayList<>();
+                        if (array != null) {
+                            for (int i = 0; i < array.length(); i++) {
+                                blockedList.add(array.getString(i));
+                            }
+                        }
 
-    private void syncApps() {
-        new Thread(() -> {
-            try {
-                String deviceId = prefs.getDeviceId();
-                if (deviceId == null) return;
-
-                List<Map<String, Object>> currentApps = UsageStatsHelper.getTodayUsageMinutes(this);
-                if (currentApps == null || currentApps.isEmpty()) return;
-
-                Map<String, Object> payload = new HashMap<>();
-                payload.put("deviceId", deviceId);
-                payload.put("apps", currentApps);
-
-                RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
-                Request req = new Request.Builder().url(BASE_URL + "/apps").post(body).build();
-
-                try (Response res = client.newCall(req).execute()) {
-                    if (res.isSuccessful()) {
-                        Log.d("SyncService", "✅ Apps Synced (" + currentApps.size() + ")");
+                        // Save locally so SettingsBlockerService can read it
+                        prefs.saveBlockedPackages(blockedList);
+                        Log.d("SyncService", "🚫 Blocked List Updated: " + blockedList.size() + " apps");
                     } else {
-                        Log.e("SyncService", "❌ App Sync failed: " + res.code());
+                        Log.e("SyncService", "❌ Block List Sync Failed: " + res.code());
                     }
                 }
             } catch (Exception e) {
-                Log.e("SyncService", "❌ App Sync Failed", e);
+                Log.e("SyncService", "❌ Block List Error: " + e.getMessage());
             }
         }).start();
     }
 
     // =========================================================
-    // 🌐 3. BROWSER HISTORY SYNC LOOP
+    // 🌐 2. BROWSER HISTORY SYNC LOOP
     // =========================================================
     private final Runnable browserSyncRunnable = new Runnable() {
         @Override
@@ -207,48 +170,85 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 🚫 4. BLOCKED APPS SYNC LOOP (Every 2 Minutes)
+    // 📍 3. LOCATION SYNC LOOP
     // =========================================================
-    private final Runnable blockedAppsRunnable = new Runnable() {
+    private final Runnable locationRunnable = new Runnable() {
         @Override
         public void run() {
-            syncBlockedApps();
-            handler.postDelayed(this, BLOCKED_SYNC_INTERVAL_MS);
+            locationHelper.fetchCurrentLocation(location -> {
+                sendLocationData(location);
+            });
+            long interval = (getBatteryLevel() < 15) ? (30 * 60 * 1000) : 45000;
+            handler.postDelayed(this, interval);
         }
     };
 
-    private void syncBlockedApps() {
+    private void sendLocationData(Location loc) {
         new Thread(() -> {
             try {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
-                // Request blocked list from Server
-                Request req = new Request.Builder()
-                        .url(BASE_URL + "/rules/blocked/" + deviceId) // Endpoint: /api/rules/blocked/:id
-                        .get()
-                        .build();
+                if (prefs.hasLastSentLocation()) {
+                    double dist = calculateDistance(prefs.getLastSentLatitude(), prefs.getLastSentLongitude(), loc.getLatitude(), loc.getLongitude());
+                    if (dist < DISTANCE_THRESHOLD_METERS) return;
+                }
+
+                Map<String, Object> data = new HashMap<>();
+                data.put("deviceId", deviceId);
+                data.put("latitude", loc.getLatitude());
+                data.put("longitude", loc.getLongitude());
+                data.put("batteryLevel", getBatteryLevel());
+
+                RequestBody body = RequestBody.create(gson.toJson(data), MediaType.get("application/json"));
+                Request req = new Request.Builder().url(BASE_URL + "/location").post(body).build();
 
                 try (Response res = client.newCall(req).execute()) {
-                    if (res.isSuccessful() && res.body() != null) {
-                        String jsonStr = res.body().string();
-                        JSONObject json = new JSONObject(jsonStr);
-                        JSONArray array = json.optJSONArray("blockedPackages");
+                    if (res.isSuccessful()) {
+                        prefs.saveLastSentLocation(loc.getLatitude(), loc.getLongitude());
+                        Log.d("SyncService", "Location Sent ✅");
+                    }
+                }
+            } catch (Exception e) { Log.e("SyncService", "Loc Send Failed", e); }
+        }).start();
+    }
 
-                        List<String> blockedList = new ArrayList<>();
-                        if (array != null) {
-                            for (int i = 0; i < array.length(); i++) {
-                                blockedList.add(array.getString(i));
-                            }
-                        }
+    // =========================================================
+    // 📱 4. APP USAGE SYNC LOOP
+    // =========================================================
+    private final Runnable appUsageRunnable = new Runnable() {
+        @Override
+        public void run() {
+            syncApps();
+            handler.postDelayed(this, APP_SYNC_INTERVAL_MS);
+        }
+    };
 
-                        // Save to Local Storage for SettingsBlockerService to use
-                        prefs.saveBlockedPackages(blockedList);
-                        Log.d("SyncService", "🚫 Blocked Apps Updated: " + blockedList.size());
+    private void syncApps() {
+        new Thread(() -> {
+            try {
+                String deviceId = prefs.getDeviceId();
+                if (deviceId == null) return;
+
+                List<Map<String, Object>> currentApps = UsageStatsHelper.getTodayUsageMinutes(this);
+                if (currentApps == null || currentApps.isEmpty()) return;
+
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("deviceId", deviceId);
+                payload.put("apps", currentApps);
+
+                RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
+                Request req = new Request.Builder().url(BASE_URL + "/apps").post(body).build();
+
+                try (Response res = client.newCall(req).execute()) {
+                    if (res.isSuccessful()) {
+                        Log.d("SyncService", "✅ Apps Synced (" + currentApps.size() + ")");
+                    } else {
+                        Log.e("SyncService", "❌ App Sync failed: " + res.code());
                     }
                 }
             } catch (Exception e) {
-                Log.e("SyncService", "❌ Blocked Apps Sync Failed", e);
+                Log.e("SyncService", "❌ App Sync Failed", e);
             }
         }).start();
     }
