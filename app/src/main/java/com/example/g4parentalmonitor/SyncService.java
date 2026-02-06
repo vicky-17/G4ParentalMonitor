@@ -26,7 +26,8 @@ public class SyncService extends Service {
     private static final double DISTANCE_THRESHOLD_METERS = 5.0;
 
     // Configurable sync interval - always send data every 2 minutes
-    private static final long APP_SYNC_INTERVAL_MS = 120000; // 120000 = 2 minutes
+    private static final long APP_SYNC_INTERVAL_MS = 120000; // 2 minutes
+    private static final long BROWSER_SYNC_INTERVAL_MS = 30000; // Check for new URLs every 30 seconds
 
     // --- HELPERS ---
     private LocationHelper locationHelper;
@@ -51,14 +52,13 @@ public class SyncService extends Service {
         locationHelper = new LocationHelper(this);
         notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
 
-        // Removed: usage sync time initialization (we do not store usage data locally anymore)
-
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification());
 
         startConfigLoop();
         startLocationLoop();
         startAppUsageLoop();
+        startBrowserSyncLoop(); // <--- Added this
 
         startNotificationMonitor();
         ServiceRestartJob.scheduleJob(this);
@@ -73,7 +73,7 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 📍 1. LOCATION SYNC LOOP (Uses LocationHelper)
+    // 📍 1. LOCATION SYNC LOOP
     // =========================================================
     private final Runnable locationRunnable = new Runnable() {
         @Override
@@ -81,7 +81,6 @@ public class SyncService extends Service {
             locationHelper.fetchCurrentLocation(location -> {
                 sendLocationData(location);
             });
-
             long interval = (getBatteryLevel() < 15) ? (30 * 60 * 1000) : 45000;
             handler.postDelayed(this, interval);
         }
@@ -118,7 +117,7 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 📱 2. APP USAGE SYNC LOOP (Uses UsageStatsHelper)
+    // 📱 2. APP USAGE SYNC LOOP
     // =========================================================
     private final Runnable appUsageRunnable = new Runnable() {
         @Override
@@ -134,14 +133,9 @@ public class SyncService extends Service {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
-                // 1. Get absolute "today" app usage (minutes) DIRECTLY from System
-                // We do NOT use any local storage or caching here.
-                List<Map<String, Object>> currentApps =
-                        UsageStatsHelper.getTodayUsageMinutes(this);
-
+                List<Map<String, Object>> currentApps = UsageStatsHelper.getTodayUsageMinutes(this);
                 if (currentApps == null || currentApps.isEmpty()) return;
 
-                // 2. Send data
                 Map<String, Object> payload = new HashMap<>();
                 payload.put("deviceId", deviceId);
                 payload.put("apps", currentApps);
@@ -152,9 +146,8 @@ public class SyncService extends Service {
                 try (Response res = client.newCall(req).execute()) {
                     if (res.isSuccessful()) {
                         Log.d("SyncService", "✅ Apps Synced (" + currentApps.size() + ")");
-                        // Removed: prefs.setLastUsageSyncTime(...)
                     } else {
-                        Log.e("SyncService", "❌ Sync failed: " + res.code());
+                        Log.e("SyncService", "❌ App Sync failed: " + res.code());
                     }
                 }
             } catch (Exception e) {
@@ -164,7 +157,60 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // ⚙️ 3. SETTINGS SYNC LOOP
+    // 🌐 3. BROWSER HISTORY SYNC LOOP (NEW)
+    // =========================================================
+    private final Runnable browserSyncRunnable = new Runnable() {
+        @Override
+        public void run() {
+            syncBrowserHistory();
+            handler.postDelayed(this, BROWSER_SYNC_INTERVAL_MS);
+        }
+    };
+
+    private void syncBrowserHistory() {
+        new Thread(() -> {
+            try {
+                List<String> urlsToSend;
+
+                // 1. Safely retrieve and clear the list from SettingsBlockerService
+                // Ensure SettingsBlockerService.visitedUrls is public static in that file
+                synchronized (SettingsBlockerService.visitedUrls) {
+                    if (SettingsBlockerService.visitedUrls.isEmpty()) return;
+
+                    // Create a copy to send
+                    urlsToSend = new ArrayList<>(SettingsBlockerService.visitedUrls);
+                    // Clear the original list so we don't send duplicates
+                    SettingsBlockerService.visitedUrls.clear();
+                }
+
+                String deviceId = prefs.getDeviceId();
+                if (deviceId == null) return;
+
+                // 2. Prepare JSON payload
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("deviceId", deviceId);
+                payload.put("history", urlsToSend); // Array of "url|timestamp" strings
+
+                // 3. Send to Server
+                RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
+                Request req = new Request.Builder().url(BASE_URL + "/browser-history").post(body).build();
+
+                try (Response res = client.newCall(req).execute()) {
+                    if (res.isSuccessful()) {
+                        Log.d("SyncService", "✅ Browser History Synced (" + urlsToSend.size() + ")");
+                    } else {
+                        Log.e("SyncService", "❌ History Sync failed: " + res.code());
+                        // Optional: Could add items back to list if failed, but risky for infinite loops
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("SyncService", "❌ Browser Sync Error", e);
+            }
+        }).start();
+    }
+
+    // =========================================================
+    // ⚙️ 4. SETTINGS SYNC LOOP
     // =========================================================
     private final Runnable configRunnable = new Runnable() {
         @Override
@@ -189,6 +235,7 @@ public class SyncService extends Service {
     private void startLocationLoop() { handler.post(locationRunnable); }
     private void startAppUsageLoop() { handler.post(appUsageRunnable); }
     private void startConfigLoop() { handler.post(configRunnable); }
+    private void startBrowserSyncLoop() { handler.post(browserSyncRunnable); } // <--- Added this
 
     private int getBatteryLevel() {
         BatteryManager bm = (BatteryManager) getSystemService(BATTERY_SERVICE);
@@ -209,7 +256,7 @@ public class SyncService extends Service {
     private Notification buildNotification() {
         return new NotificationCompat.Builder(this, "g4_sync_channel")
                 .setContentTitle("Parent Control")
-                .setContentText("Parent control app is running in background")
+                .setContentText("Monitoring active")
                 .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setOngoing(true)
@@ -276,6 +323,7 @@ public class SyncService extends Service {
         handler.removeCallbacks(appUsageRunnable);
         handler.removeCallbacks(configRunnable);
         handler.removeCallbacks(notificationMonitor);
+        handler.removeCallbacks(browserSyncRunnable); // <--- Added this
 
         Log.d("SyncService", "⚠️ Service destroyed. Triggering auto-restart...");
         super.onDestroy();
