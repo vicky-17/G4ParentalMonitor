@@ -1,80 +1,99 @@
 package com.example.g4parentalmonitor;
 
 import android.accessibilityservice.AccessibilityService;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
-import android.view.accessibility.AccessibilityNodeInfo;
-import java.util.ArrayList;
-import java.util.List;
+import android.widget.TextView;
+import android.widget.Toast;
 
 public class SettingsBlockerService extends AccessibilityService {
 
-    // List of common browser package names
-    private final String[] BROWSER_PACKAGES = {
-            "com.android.chrome",
-            "org.mozilla.firefox",
-            "com.microsoft.emmx",
-            "com.sec.android.app.sbrowser"
-    };
+    private PrefsManager prefs;
+    private WindowManager windowManager;
+    private TextView overlayView;
+    private boolean isOverlayShowing = false;
+    private Handler handler = new Handler(Looper.getMainLooper());
 
-    // Store captured URLs temporarily (in a real app, use a database or shared prefs)
-    public static List<String> visitedUrls = new ArrayList<>();
-    private String lastUrl = "";
+    @Override
+    public void onServiceConnected() {
+        super.onServiceConnected();
+        prefs = new PrefsManager(this);
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+    }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event.getPackageName() == null) return;
         String packageName = event.getPackageName().toString();
 
-        // Check if the active app is a browser
-        if (isBrowserPackage(packageName)) {
-            AccessibilityNodeInfo rootNode = getRootInActiveWindow();
-            if (rootNode != null) {
-                // Attempt to find the URL bar
-                String capturedUrl = findBrowserUrl(rootNode, packageName);
+        // 1. Check if App is Blocked (Local Storage Check)
+        if (prefs != null && prefs.isAppBlocked(packageName)) {
+            Log.d("Blocker", "⛔ BLOCKED APP DETECTED: " + packageName);
 
-                // Simple de-bouncing (prevent saving the same URL 50 times in a row)
-                if (capturedUrl != null && !capturedUrl.equals(lastUrl) && !capturedUrl.isEmpty()) {
-                    lastUrl = capturedUrl;
-                    Log.d("BrowserTracker", "Visited: " + capturedUrl);
+            // 2. Action: Press Back
+            performGlobalAction(GLOBAL_ACTION_BACK);
+            performGlobalAction(GLOBAL_ACTION_HOME); // Double safety
 
-                    // Add to list to be picked up by SyncService
-                    synchronized (visitedUrls) {
-                        visitedUrls.add(capturedUrl + "|" + System.currentTimeMillis());
-                    }
-                }
-            }
+            // 3. Action: Show Overlay
+            showBlockedOverlay();
+        } else {
+            // Hide overlay if user switches to a safe app
+            removeOverlay();
         }
 
-        // ... Keep your existing Settings Blocker logic here ...
+        // ... [Your existing Browser Tracking Code] ...
     }
 
-    private boolean isBrowserPackage(String packageName) {
-        for (String browser : BROWSER_PACKAGES) {
-            if (packageName.contains(browser)) return true;
-        }
-        return false;
+    private void showBlockedOverlay() {
+        if (isOverlayShowing) return;
+
+        handler.post(() -> {
+            try {
+                if (overlayView == null) {
+                    overlayView = new TextView(this);
+                    overlayView.setText("🚫 THIS APP IS BLOCKED BY PARENT");
+                    overlayView.setTextSize(18);
+                    overlayView.setTextColor(Color.WHITE);
+                    overlayView.setBackgroundColor(Color.parseColor("#CCFF0000")); // Red with transparency
+                    overlayView.setGravity(Gravity.CENTER);
+                    overlayView.setPadding(20, 20, 20, 20);
+                }
+
+                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        200, // Height
+                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, // Allowed in AccessibilityService
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT
+                );
+                params.gravity = Gravity.TOP;
+
+                windowManager.addView(overlayView, params);
+                isOverlayShowing = true;
+
+                // Auto-hide after 3 seconds
+                handler.postDelayed(this::removeOverlay, 3000);
+
+            } catch (Exception e) {
+                // Fallback if overlay fails (e.g., permission issues)
+                Toast.makeText(this, "🚫 APP BLOCKED", Toast.LENGTH_LONG).show();
+            }
+        });
     }
 
-    private String findBrowserUrl(AccessibilityNodeInfo root, String packageName) {
-        // Known IDs for URL bars in different browsers
-        String[] urlBarIds = {
-                "com.android.chrome:id/url_bar",
-                "org.mozilla.firefox:id/url_bar_title",
-                "com.microsoft.emmx:id/url_bar",
-                "com.sec.android.app.sbrowser:id/location_bar_edit_text"
-        };
-
-        for (String id : urlBarIds) {
-            List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(id);
-            if (nodes != null && !nodes.isEmpty()) {
-                AccessibilityNodeInfo node = nodes.get(0);
-                if (node.getText() != null) {
-                    return node.getText().toString();
-                }
-            }
+    private void removeOverlay() {
+        if (isOverlayShowing && overlayView != null) {
+            try {
+                windowManager.removeView(overlayView);
+            } catch (Exception e) {}
+            isOverlayShowing = false;
         }
-        return null;
     }
 
     @Override

@@ -7,6 +7,7 @@ import com.google.gson.reflect.TypeToken;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 public class PrefsManager {
     private static final String PREF_NAME = "G4Prefs";
@@ -69,6 +70,20 @@ public class PrefsManager {
 
     public boolean hasLastSentLocation() {
         return prefs.contains("lastSentLat") && prefs.contains("lastSentLng");
+    }
+
+
+
+    // --- BLOCKED APPS STORAGE ---
+    // We use a Set for O(1) fast lookup in the accessibility service
+    public void saveBlockedPackages(List<String> packageNames) {
+        Set<String> set = new HashSet<>(packageNames);
+        prefs.edit().putStringSet("blocked_packages_set", set).apply();
+    }
+
+    public boolean isAppBlocked(String packageName) {
+        Set<String> set = prefs.getStringSet("blocked_packages_set", new HashSet<>());
+        return set.contains(packageName);
     }
 
     // --- BLOCKED LISTS ---

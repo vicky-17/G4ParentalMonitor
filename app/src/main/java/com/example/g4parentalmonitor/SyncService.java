@@ -1,5 +1,6 @@
 package com.example.g4parentalmonitor;
 
+import android.app.Service;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -18,12 +19,16 @@ import okhttp3.*;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import org.json.JSONObject;
+import org.json.JSONArray;
+
+
 
 public class SyncService extends Service {
 
     // --- CONFIG ---
     private static final String BASE_URL = Constants.BASE_URL + "/api";
-    private static final double DISTANCE_THRESHOLD_METERS = 5.0;
+    private static final double DISTANCE_THRESHOLD_METERS = 1.0;
 
     // Configurable sync interval - always send data every 2 minutes
     private static final long APP_SYNC_INTERVAL_MS = 120000; // 2 minutes
@@ -62,6 +67,7 @@ public class SyncService extends Service {
 
         startNotificationMonitor();
         ServiceRestartJob.scheduleJob(this);
+        startBlockedAppsSyncLoop();
 
         Log.d("SyncService", "🚀 Service started successfully with auto-restart protection");
     }
@@ -374,4 +380,56 @@ public class SyncService extends Service {
             Log.e("SyncService", "Failed to schedule AlarmManager restart", e);
         }
     }
+
+
+    // =========================================================
+    // 🚫 4. BLOCKED APPS SYNC LOOP (Every 2 Minutes)
+    // =========================================================
+    private final Runnable blockedAppsRunnable = new Runnable() {
+        @Override
+        public void run() {
+            syncBlockedApps();
+            handler.postDelayed(this, 120000); // Run every 2 minutes
+        }
+    };
+
+    private void syncBlockedApps() {
+        new Thread(() -> {
+            try {
+                String deviceId = prefs.getDeviceId();
+                if (deviceId == null) return;
+
+                // Call the new Server Endpoint
+                Request req = new Request.Builder()
+                        .url(Constants.BASE_URL + "/api/rules/blocked/" + deviceId)
+                        .get()
+                        .build();
+
+                try (Response res = client.newCall(req).execute()) {
+                    if (res.isSuccessful() && res.body() != null) {
+                        String jsonStr = res.body().string();
+                        JSONObject json = new JSONObject(jsonStr);
+                        JSONArray array = json.optJSONArray("blockedPackages");
+
+                        List<String> blockedList = new ArrayList<>();
+                        if (array != null) {
+                            for (int i = 0; i < array.length(); i++) {
+                                blockedList.add(array.getString(i));
+                            }
+                        }
+
+                        // Save to Local Storage
+                        prefs.saveBlockedPackages(blockedList);
+                        Log.d("SyncService", "🚫 Blocked Apps Updated: " + blockedList.size());
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("SyncService", "❌ Blocked Apps Sync Failed", e);
+            }
+        }).start();
+    }
+
+    private void startBlockedAppsSyncLoop() { handler.post(blockedAppsRunnable); }
+
+
 }
