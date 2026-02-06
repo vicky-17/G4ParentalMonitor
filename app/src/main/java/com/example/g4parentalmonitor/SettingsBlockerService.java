@@ -11,6 +11,8 @@ import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.widget.TextView;
 import android.widget.Toast;
+import java.util.ArrayList;
+import java.util.List;
 
 public class SettingsBlockerService extends AccessibilityService {
 
@@ -19,6 +21,8 @@ public class SettingsBlockerService extends AccessibilityService {
     private TextView overlayView;
     private boolean isOverlayShowing = false;
     private Handler handler = new Handler(Looper.getMainLooper());
+
+    public static List<String> visitedUrls = new ArrayList<>();
 
     @Override
     public void onServiceConnected() {
