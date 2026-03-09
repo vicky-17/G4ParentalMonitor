@@ -187,15 +187,15 @@ class MainActivity : ComponentActivity() {
             onDispose { lcOwner.lifecycle.removeObserver(obs) }
         }
 
-        // Permission states
-        val usageOk   = hasUsageStatsPermission()
-        val filesOk   = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
-        val runtimeOk = areRuntimePermissionsGranted()
-        val overlayOk = hasOverlayPermission()
-        val batteryOk = isBatteryOptimizationIgnored()
-        val adminOk   = isDeviceAdminActive(ctx)
-        val accessOk  = isAccessibilityServiceEnabled(ctx, LiveGuardianService::class.java)
-        val vpnPermOk = isVpnPermissionGranted()
+        // Permission states — re-evaluated on every resume (tick changes)
+        var usageOk   by remember { mutableStateOf(hasUsageStatsPermission()) }
+        var filesOk   by remember { mutableStateOf(Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()) }
+        var runtimeOk by remember { mutableStateOf(areRuntimePermissionsGranted()) }
+        var overlayOk by remember { mutableStateOf(hasOverlayPermission()) }
+        var batteryOk by remember { mutableStateOf(isBatteryOptimizationIgnored()) }
+        var adminOk   by remember { mutableStateOf(isDeviceAdminActive(ctx)) }
+        var accessOk  by remember { mutableStateOf(isAccessibilityServiceEnabled(ctx, LiveGuardianService::class.java)) }
+        var vpnPermOk by remember { mutableStateOf(isVpnPermissionGranted()) }
         val allOk     = usageOk && filesOk && runtimeOk && overlayOk && batteryOk
 
         // VPN state — read from prefs AND live service flag
@@ -205,10 +205,9 @@ class MainActivity : ComponentActivity() {
         var keepAliveEnabled  by remember { mutableStateOf(prefs.isKeepVpnAlive()) }
         var preventOverride   by remember { mutableStateOf(prefs.isPreventVpnOverride()) }
 
-        val vpnRunning = vpnEnabled && DnsVpnService.serviceRunning
+        val vpnRunning = vpnEnabled  // UI reflects toggle immediately; serviceRunning syncs on resume
 
         // App usage data
-        data class AppEntry(val name: String, val pkg: String, val ms: Long)
         var list      by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
         var updatedAt by remember { mutableStateOf<Long?>(null) }
         var loading   by remember { mutableStateOf(true) }
@@ -218,6 +217,20 @@ class MainActivity : ComponentActivity() {
         val progress by animateFloatAsState(grantedCount / 5f, tween(700), label = "prog")
 
         LaunchedEffect(tick) {
+            // Refresh all permission states on every resume
+            usageOk   = hasUsageStatsPermission()
+            filesOk   = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+            runtimeOk = areRuntimePermissionsGranted()
+            overlayOk = hasOverlayPermission()
+            batteryOk = isBatteryOptimizationIgnored()
+            adminOk   = isDeviceAdminActive(ctx)
+            accessOk  = isAccessibilityServiceEnabled(ctx, LiveGuardianService::class.java)
+            vpnPermOk = isVpnPermissionGranted()
+
+            // Sync VPN toggle with actual running state
+            val vpnActuallyRunning = DnsVpnService.serviceRunning
+            if (vpnActuallyRunning != vpnEnabled) vpnEnabled = vpnActuallyRunning
+
             loading = true
             withContext(Dispatchers.IO) {
                 val usageMap = UsageStatsHelper.getEventBasedDailyUsage(ctx)
@@ -892,7 +905,7 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun ScreenTimeSection(
-        list: List<Any?>,
+        list: List<AppEntry>,
         updatedAt: Long?,
         loading: Boolean,
         showAll: Boolean,
@@ -900,9 +913,6 @@ class MainActivity : ComponentActivity() {
         onRefresh: () -> Unit,
         onShowAll: () -> Unit
     ) {
-        @Suppress("UNCHECKED_CAST")
-        data class AppEntry(val name: String, val pkg: String, val ms: Long)
-
         Row(
             Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -952,23 +962,57 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.width(10.dp))
                 Text("Usage Access permission required.", color = CrimsonOff, fontSize = 13.sp)
             }
+        } else if (list.isEmpty()) {
+            Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+                Text("No usage data today yet.", color = TxtSecondary, fontSize = 14.sp)
+            }
         } else {
-            // Cast back to typed list for display
-            val typedList = list.filterNotNull().map {
-                val entry = it as? Map<*, *>
-                Triple(
-                    entry?.get("name") as? String ?: "Unknown",
-                    entry?.get("pkg")  as? String ?: "",
-                    (entry?.get("ms")  as? Long)  ?: 0L
-                )
-            }.sortedByDescending { it.third }
+            val displayList = if (showAll) list else list.take(5)
+            displayList.forEach { entry ->
+                val totalMinutes = entry.ms / 60_000
+                val hours = totalMinutes / 60
+                val mins  = totalMinutes % 60
+                val timeStr = if (hours > 0) "${hours}h ${mins}m" else "${mins}m"
 
-            if (typedList.isEmpty()) {
-                Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
-                    Text("No usage data today yet.", color = TxtSecondary, fontSize = 14.sp)
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Bg2)
+                        .border(1.dp, Border, RoundedCornerShape(12.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(entry.name, color = TxtPrimary, fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold, maxLines = 1,
+                            overflow = TextOverflow.Ellipsis)
+                        Text(entry.pkg, color = TxtTertiary, fontSize = 10.sp,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Text(timeStr, color = BlueCore, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 }
             }
-            // Actually the parent passes real AppEntry data so show actual usage rows
+
+            if (list.size > 5) {
+                Spacer(Modifier.height(8.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Bg2)
+                        .border(1.dp, Border, RoundedCornerShape(10.dp))
+                        .clickable(onClick = onShowAll)
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        if (showAll) "Show less ▲" else "Show all ${list.size} apps ▼",
+                        color = BlueCore, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
         }
     }
 
@@ -1157,3 +1201,6 @@ class MainActivity : ComponentActivity() {
 
 data class AppUsageItem(val name: String, val packageName: String, val minutes: Long)
 data class RawUsageItem(val name: String, val packageName: String, val minutes: Long, val totalMs: Long)
+data class AppEntry(val name: String, val pkg: String, val ms: Long)
+
+
