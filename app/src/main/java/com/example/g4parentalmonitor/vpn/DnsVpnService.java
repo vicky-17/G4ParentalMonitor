@@ -350,25 +350,23 @@ public class DnsVpnService extends VpnService {
                 DnsFilterEngine.FilterDecision decision = filterEngine.decide(query.domain, query.queryType);
                 byte[] response;
 
-                if (decision instanceof DnsFilterEngine.FilterDecision.Block) {
+                if (decision instanceof DnsFilterEngine.Block) {
                     response = DnsPacketParser.buildNxDomainResponse(query);
                     Log.d(TAG, "🚫 " + query.domain);
-                } else if (decision instanceof DnsFilterEngine.FilterDecision.SafeSearch) {
-                    String ip = ((DnsFilterEngine.FilterDecision.SafeSearch) decision).redirectIp;
+                } else if (decision instanceof DnsFilterEngine.SafeSearch) {
+                    String ip = ((DnsFilterEngine.SafeSearch) decision).redirectIp;
                     response = DnsPacketParser.buildARecordResponse(query, ip);
                     Log.d(TAG, "🔍 SafeSearch " + query.domain + " → " + ip);
                 } else {
-                    // ✅ Allow — record domain for history sync
                     WebUrlDetector.recordVpnDomain(query.domain);
                     response = forwardUpstream(query, buf, len);
                 }
 
                 if (response != null) { out.write(response); out.flush(); }
             }
-        } catch (InterruptedException e) {
-            Log.i(TAG, "DNS loop interrupted");
         } catch (Exception e) {
             if (isRunning) Log.e(TAG, "DNS loop error", e);
+            else Log.i(TAG, "DNS loop stopped");
         }
     }
 

@@ -20,6 +20,9 @@ import com.example.g4parentalmonitor.data.PrefsManager;
 import com.example.g4parentalmonitor.logic.BlockedAppsDetector;
 import com.example.g4parentalmonitor.logic.ShortsDetector;
 import com.example.g4parentalmonitor.utils.ScreenTimeTracker; // Ensure this matches your package
+import com.example.g4parentalmonitor.vpn.WebUrlDetector;
+
+
 
 public class LiveGuardianService extends AccessibilityService {
 
