@@ -1,4 +1,4 @@
-package com.example.g4parentalmonitor.logic;
+package com.example.g4parentalmonitor.vpn;
 
 import android.util.Log;
 import android.view.accessibility.AccessibilityNodeInfo;

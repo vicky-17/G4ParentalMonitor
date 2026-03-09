@@ -359,7 +359,7 @@ public class DnsVpnService extends VpnService {
                     Log.d(TAG, "🔍 SafeSearch " + query.domain + " → " + ip);
                 } else {
                     // ✅ Allow — record domain for history sync
-                    com.example.g4parentalmonitor.logic.WebUrlDetector.recordVpnDomain(query.domain);
+                    WebUrlDetector.recordVpnDomain(query.domain);
                     response = forwardUpstream(query, buf, len);
                 }
 

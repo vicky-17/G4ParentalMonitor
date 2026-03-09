@@ -21,7 +21,7 @@ import com.example.g4parentalmonitor.utils.Constants;
 import com.example.g4parentalmonitor.utils.LocationHelper;
 import com.example.g4parentalmonitor.data.PrefsManager;
 import com.example.g4parentalmonitor.utils.UsageStatsHelper;
-import com.example.g4parentalmonitor.logic.WebUrlDetector;
+import com.example.g4parentalmonitor.vpn.WebUrlDetector;
 
 import com.google.gson.Gson;
 import okhttp3.*;
@@ -232,7 +232,7 @@ public class SyncService extends Service {
 
             try {
                 // ✅ NEW: Drain from BOTH accessibility AND VPN DNS capture
-                List<String> urlsToSend = com.example.g4parentalmonitor.logic.WebUrlDetector.drainAllUrls();
+                List<String> urlsToSend = WebUrlDetector.drainAllUrls();
 
                 if (urlsToSend.isEmpty()) return;
 
