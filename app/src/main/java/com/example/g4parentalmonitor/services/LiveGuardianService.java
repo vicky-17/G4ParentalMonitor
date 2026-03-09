@@ -1,7 +1,10 @@
 package com.example.g4parentalmonitor.services;
 
 import android.accessibilityservice.AccessibilityService;
+import android.content.BroadcastReceiver; // Added
 import android.content.Context;
+import android.content.Intent; // Added
+import android.content.IntentFilter; // Added
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.os.Handler;
@@ -12,31 +15,44 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+
 import com.example.g4parentalmonitor.data.PrefsManager;
 import com.example.g4parentalmonitor.logic.BlockedAppsDetector;
 import com.example.g4parentalmonitor.logic.ShortsDetector;
 import com.example.g4parentalmonitor.logic.WebUrlDetector;
+import com.example.g4parentalmonitor.utils.ScreenTimeTracker; // Ensure this matches your package
 
 public class LiveGuardianService extends AccessibilityService {
 
-    // The Logic Modules
     private PrefsManager prefs;
     private BlockedAppsDetector appBlocker;
     private ShortsDetector shortsBlocker;
     private WebUrlDetector webUrlDetector;
 
-    // UI Components
     private WindowManager windowManager;
-    private TextView overlayView; // For individual app blocking
+    private TextView overlayView;
     private boolean isOverlayShowing = false;
 
-    // --- 🔒 NEW LOCK SCREEN VARIABLES ---
-    private LinearLayout systemLockView; // The full screen lock
+    private LinearLayout systemLockView;
     private boolean isSystemLocked = false;
     private Handler handler = new Handler(Looper.getMainLooper());
 
-    // Global flag (Controlled by SyncService)
     public static boolean isRestrictedMode = false;
+
+    // --- STEP 1: Define the BroadcastReceiver ---
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (action == null) return;
+
+            if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                ScreenTimeTracker.getInstance(context).onScreenOff();
+            } else if (Intent.ACTION_SCREEN_ON.equals(action) || Intent.ACTION_USER_PRESENT.equals(action)) {
+                ScreenTimeTracker.getInstance(context).onScreenOn();
+            }
+        }
+    };
 
     @Override
     public void onServiceConnected() {
@@ -44,50 +60,39 @@ public class LiveGuardianService extends AccessibilityService {
         prefs = new PrefsManager(this);
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
-        // Initialize the Logic Modules
         appBlocker = new BlockedAppsDetector(prefs);
         shortsBlocker = new ShortsDetector();
         webUrlDetector = new WebUrlDetector();
 
-        // Start the background enforcement loop
         startEnforcementLoop();
-    }
 
-    // --- 🔄 BACKGROUND LOOP (Checks every 0.5s) ---
-    private void startEnforcementLoop() {
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                checkRestrictedState();
-                handler.postDelayed(this, 500); // Repeat every 500ms
-            }
-        }, 500);
-    }
+        // --- STEP 2: Register the Receiver ---
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        registerReceiver(screenReceiver, filter);
 
-    private void checkRestrictedState() {
-        if (isRestrictedMode) {
-            if (!isSystemLocked) {
-                showLockScreen(); // 🛑 LOCK IT
-            }
-        } else {
-            if (isSystemLocked) {
-                hideLockScreen(); // ✅ UNLOCK IT
-            }
-        }
+        // Initialize tracker state
+        ScreenTimeTracker.getInstance(this).onScreenOn();
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        // --- STEP 3: Track App Usage via Window Changes ---
+        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            CharSequence pkgName = event.getPackageName();
+            if (pkgName != null) {
+                ScreenTimeTracker.getInstance(this).onAppForegrounded(pkgName.toString());
+            }
+        }
+
         if (event.getPackageName() == null) return;
         String packageName = event.getPackageName().toString();
-
-        // Note: The "Internet Lock" is now handled by the background loop above.
-        // We don't need to check isRestrictedMode here anymore.
-
         AccessibilityNodeInfo rootNode = getRootInActiveWindow();
 
         try {
-            // 1. Live App Blocker
+            // App Blocker
             if (appBlocker.shouldBlockApp(packageName)) {
                 performGlobalAction(GLOBAL_ACTION_BACK);
                 performGlobalAction(GLOBAL_ACTION_HOME);
@@ -97,7 +102,7 @@ public class LiveGuardianService extends AccessibilityService {
                 removeOverlay();
             }
 
-            // 2. Live Shorts Blocker
+            // Shorts Blocker
             if (prefs != null && prefs.isBlockShortsEnabled()) {
                 if (rootNode != null && shortsBlocker.shouldBlockView(rootNode, packageName)) {
                     performGlobalAction(GLOBAL_ACTION_BACK);
@@ -105,7 +110,7 @@ public class LiveGuardianService extends AccessibilityService {
                 }
             }
 
-            // 3. Web Tracker
+            // Web Tracker
             if (rootNode != null && webUrlDetector.isBrowser(packageName)) {
                 webUrlDetector.processBrowserEvent(rootNode);
             }
@@ -114,23 +119,44 @@ public class LiveGuardianService extends AccessibilityService {
         }
     }
 
+    // --- STEP 4: Cleanup on Destroy ---
     @Override
-    public void onInterrupt() { }
+    public void onDestroy() {
+        super.onDestroy();
+        try {
+            unregisterReceiver(screenReceiver);
+        } catch (Exception ignored) {}
 
-    // ==========================================
-    // 🛑 NEW FULL SCREEN LOCK (The "Smooth" UI)
-    // ==========================================
+        ScreenTimeTracker.getInstance(this).onScreenOff();
+        handler.removeCallbacksAndMessages(null);
+    }
+
+    private void startEnforcementLoop() {
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                checkRestrictedState();
+                handler.postDelayed(this, 500);
+            }
+        }, 500);
+    }
+
+    private void checkRestrictedState() {
+        if (isRestrictedMode) {
+            if (!isSystemLocked) showLockScreen();
+        } else {
+            if (isSystemLocked) hideLockScreen();
+        }
+    }
+
     private void showLockScreen() {
         if (isSystemLocked || windowManager == null) return;
-
         try {
-            // Create the container
             systemLockView = new LinearLayout(this);
             systemLockView.setOrientation(LinearLayout.VERTICAL);
             systemLockView.setBackgroundColor(Color.BLACK);
             systemLockView.setGravity(Gravity.CENTER);
 
-            // Title
             TextView title = new TextView(this);
             title.setText("⚠️ DEVICE LOCKED ⚠️");
             title.setTextColor(Color.RED);
@@ -138,9 +164,8 @@ public class LiveGuardianService extends AccessibilityService {
             title.setGravity(Gravity.CENTER);
             title.setPadding(0, 0, 0, 20);
 
-            // Message
             TextView msg = new TextView(this);
-            msg.setText("Internet & Location Required.\n\nPull down the status bar and\nenable them to continue.");
+            msg.setText("Internet & Location Required.\n\nEnable them to continue.");
             msg.setTextColor(Color.WHITE);
             msg.setTextSize(16);
             msg.setGravity(Gravity.CENTER);
@@ -148,35 +173,26 @@ public class LiveGuardianService extends AccessibilityService {
             systemLockView.addView(title);
             systemLockView.addView(msg);
 
-            // Layout Params: Covers screen but allows Status Bar interaction
             WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, // High priority
-                    // UPDATED: Removed FLAG_LAYOUT_IN_SCREEN so it doesn't cover the status bar.
-                    // Added FLAG_NOT_FOCUSABLE so the status bar can receive touch events.
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                     PixelFormat.TRANSLUCENT);
 
             windowManager.addView(systemLockView, params);
             isSystemLocked = true;
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        } catch (Exception e) { e.printStackTrace(); }
     }
 
     private void hideLockScreen() {
         if (isSystemLocked && systemLockView != null) {
-            try {
-                windowManager.removeView(systemLockView);
-            } catch (Exception e) { e.printStackTrace(); }
+            try { windowManager.removeView(systemLockView); } catch (Exception e) {}
             systemLockView = null;
             isSystemLocked = false;
         }
     }
 
-    // --- Old App Block Overlay (Kept for specific apps) ---
     private void showBlockedOverlay() {
         if (isOverlayShowing) return;
         handler.post(() -> {
@@ -211,4 +227,7 @@ public class LiveGuardianService extends AccessibilityService {
             isOverlayShowing = false;
         }
     }
+
+    @Override
+    public void onInterrupt() { }
 }

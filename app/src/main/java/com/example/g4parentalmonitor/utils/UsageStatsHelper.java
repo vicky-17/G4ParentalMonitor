@@ -5,6 +5,7 @@ import android.app.usage.UsageStatsManager;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,60 +20,26 @@ import java.util.Set;
 
 public class UsageStatsHelper {
 
-    /**
-     * FINAL APPROACH — Pure event-based, midnight to now.
-     * NO queryUsageStats(INTERVAL_DAILY) — it bleeds yesterday's data on MIUI.
-     *
-     * Core rules:
-     *  1. Only MOVE_TO_FOREGROUND / MOVE_TO_BACKGROUND events used.
-     *  2. "One real app in foreground at a time" — when app A gets FOREGROUND,
-     *     close app B's session. No need for BACKGROUND to fire (MIUI fix).
-     *  3. TRANSPARENT_PACKAGES (systemui, launcher etc.) are invisible —
-     *     they don't close or open real app sessions.
-     *  4. SCREEN_NON_INTERACTIVE / KEYGUARD_SHOWN closes all sessions.
-     *  5. Inactivity cap: if no event for >30min, cap the session there
-     *     (handles MIUI missing SCREEN_OFF events).
-     *  6. Hard max: 3h per single continuous session.
-     *  7. Live top-up for the currently open app.
-     *
-     * WHY THE 10-MINUTE WHATSAPP GAP EXISTED:
-     *  - It was the live session not being counted: WhatsApp was open when
-     *    we refreshed, and the MOVE_TO_FOREGROUND already happened but
-     *    no BACKGROUND had fired yet. The live top-up handles this.
-     *  - The remaining small difference from Digital Wellbeing is expected:
-     *    DW is a system app and counts foreground service time too.
-     *    We cannot replicate that exactly as a third-party app.
-     */
+    private static final String TAG = "UsageStatsHelper";
 
+    /**
+     * TRANSPARENT PACKAGES — system UI and launchers.
+     * Both tracker and event-based ignore these when they take foreground.
+     */
     private static final Set<String> TRANSPARENT_PACKAGES = new HashSet<>(Arrays.asList(
-            // Android core
-            "com.android.systemui",
-            "android",
-            "com.android.launcher",
-            "com.android.launcher2",
-            "com.android.launcher3",
-            "com.android.permissioncontroller",
-            "com.google.android.permissioncontroller",
-            "com.android.packageinstaller",
-            // MIUI / Xiaomi
-            "com.miui.home",
-            "com.miui.systemui",
-            "com.miui.securityinputmethod",
-            "com.miui.miwallpaper",
-            "com.xiaomi.mi_connect_service",
-            // Google launcher
-            "com.google.android.launcher",
-            "com.google.android.apps.nexuslauncher",
-            // Other OEM launchers
-            "com.sec.android.app.launcher",
-            "com.oneplus.launcher",
-            "com.oppo.launcher",
-            "com.bbk.launcher2"
+            "com.android.systemui", "android",
+            "com.android.launcher", "com.android.launcher2", "com.android.launcher3",
+            "com.miui.home", "com.miui.systemui", "com.miui.securityinputmethod",
+            "com.google.android.launcher", "com.google.android.apps.nexuslauncher",
+            "com.sec.android.app.launcher", "com.oneplus.launcher",
+            "com.oppo.launcher", "com.bbk.launcher2",
+            "com.android.permissioncontroller", "com.google.android.permissioncontroller",
+            "com.android.packageinstaller"
     ));
 
-    private static final long MIN_SESSION_MS    = 1_000;             // 1 second minimum
-    private static final long INACTIVITY_CAP_MS = 30L * 60 * 1_000; // 30 minutes
-    private static final long MAX_SESSION_MS    = 3L * 60 * 60 * 1_000; // 3 hours
+    private static final long MIN_SESSION_MS    = 1_000;
+    private static final long INACTIVITY_CAP_MS = 30L * 60 * 1_000;
+    private static final long MAX_SESSION_MS    = 3L * 60 * 60 * 1_000;
 
     private static UsageStatsManager getUsageStatsManager(Context context) {
         return (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
@@ -106,7 +73,7 @@ public class UsageStatsHelper {
             if (totalMs == 0) continue;
 
             long totalSeconds = totalMs / 1_000;
-            long minutes = (totalMs + 30_000L) / 60_000L; // round, not floor
+            long minutes = (totalMs + 30_000L) / 60_000L;
 
             Map<String, Object> data = new HashMap<>();
             data.put("packageName", pkg);
@@ -127,10 +94,76 @@ public class UsageStatsHelper {
         return result;
     }
 
+    /**
+     * PRIMARY ENTRY POINT
+     *
+     * Strategy:
+     *   1. If ScreenTimeTracker (accessibility) has data → use it as PRIMARY source.
+     *      It tracks in real-time via TYPE_WINDOW_STATE_CHANGED, much more accurate.
+     *   2. Merge with event-based as FALLBACK for any apps the tracker may have missed
+     *      (e.g. apps used before accessibility service was enabled today).
+     *   3. For each app: take MAX(tracker, event-based).
+     *      The tracker is always more accurate when running, event-based covers gaps.
+     */
     public static Map<String, Long> getEventBasedDailyUsage(Context context) {
+        ScreenTimeTracker tracker = ScreenTimeTracker.getInstance(context);
+
+        // Get accessibility tracker data (real-time, most accurate)
+        Map<String, Long> trackerMap = tracker.getTodayUsageMs();
+
+        // Get event-based data (fallback / gap filler)
+        Map<String, Long> eventMap = computeEventBased(context);
+
+        boolean trackerHasData = tracker.hasDataForToday();
+
+        if (!trackerHasData) {
+            // Accessibility service not yet enabled or no data yet — use event-based only
+            Log.d(TAG, "No tracker data — using event-based only");
+            return eventMap;
+        }
+
+        // Merge: for each app take MAX(tracker, event-based)
+        // The tracker is real-time accurate; event-based fills in anything before
+        // the accessibility service was started today.
+        Map<String, Long> merged = new HashMap<>(trackerMap);
+
+        for (Map.Entry<String, Long> entry : eventMap.entrySet()) {
+            String pkg = entry.getKey();
+            long eventMs = entry.getValue();
+
+            if (TRANSPARENT_PACKAGES.contains(pkg)) continue;
+
+            long trackerMs = merged.containsKey(pkg) ? merged.get(pkg) : 0L;
+
+            if (trackerMs == 0) {
+                // Tracker has no data for this app — use event-based (app used before service start)
+                merged.put(pkg, eventMs);
+            } else {
+                // Both have data: take max
+                // Tracker is more accurate in most cases, but if event-based is significantly
+                // higher it means the tracker missed some time (e.g. during a restart)
+                merged.put(pkg, Math.max(trackerMs, eventMs));
+            }
+        }
+
+        // Remove transparent packages from final result
+        for (String pkg : TRANSPARENT_PACKAGES) {
+            merged.remove(pkg);
+        }
+
+        Log.d(TAG, "Merged tracker (" + trackerMap.size() + " apps) + event-based ("
+                + eventMap.size() + " apps) → " + merged.size() + " apps");
+
+        return merged;
+    }
+
+    /**
+     * FALLBACK: Pure event-based from midnight.
+     * MIUI-safe: "only one real app in foreground at a time" rule.
+     */
+    private static Map<String, Long> computeEventBased(Context context) {
         UsageStatsManager usm = getUsageStatsManager(context);
 
-        // Exact local midnight
         Calendar cal = Calendar.getInstance();
         cal.set(Calendar.HOUR_OF_DAY, 0);
         cal.set(Calendar.MINUTE, 0);
@@ -143,12 +176,8 @@ public class UsageStatsHelper {
         if (events == null) return new HashMap<>();
 
         Map<String, Long> totalMap = new HashMap<>();
-
-        // The one real app currently in foreground
         String fgPkg = null;
-        long fgStart  = 0;
-
-        // Timestamp of the last meaningful event (for inactivity cap)
+        long fgStart = 0;
         long lastEventTs = midnight;
 
         UsageEvents.Event ev = new UsageEvents.Event();
@@ -160,44 +189,34 @@ public class UsageStatsHelper {
             int  type = ev.getEventType();
             String pkg = ev.getPackageName();
 
-            if (ts < midnight) continue; // safety guard
+            if (ts < midnight) continue;
 
-            // ── SCREEN OFF / LOCK ────────────────────────────────────────────
             if (type == UsageEvents.Event.SCREEN_NON_INTERACTIVE
                     || type == UsageEvents.Event.KEYGUARD_SHOWN) {
                 if (fgPkg != null) {
                     long dur = ts - fgStart;
                     if (dur >= MIN_SESSION_MS && dur < MAX_SESSION_MS)
                         addTime(totalMap, fgPkg, dur);
-                    fgPkg = null;
-                    fgStart = 0;
+                    fgPkg = null; fgStart = 0;
                 }
                 lastEventTs = ts;
                 continue;
             }
 
-            // ── SCREEN ON / UNLOCK ───────────────────────────────────────────
             if (type == UsageEvents.Event.SCREEN_INTERACTIVE
                     || type == UsageEvents.Event.KEYGUARD_HIDDEN) {
                 lastEventTs = ts;
                 continue;
             }
 
-            // ── APP FOREGROUND ───────────────────────────────────────────────
             if (type == UsageEvents.Event.MOVE_TO_FOREGROUND) {
-
-                // Ignore transparent system packages
                 if (TRANSPARENT_PACKAGES.contains(pkg)) continue;
 
-                // Close previous real app session
                 if (fgPkg != null && !fgPkg.equals(pkg)) {
                     long dur;
                     long gap = ts - lastEventTs;
                     if (gap > INACTIVITY_CAP_MS) {
-                        // Long gap since last event — screen was probably off.
-                        // Cap session at lastEventTs + INACTIVITY_CAP_MS.
-                        long cappedEnd = lastEventTs + INACTIVITY_CAP_MS;
-                        dur = Math.max(0, cappedEnd - fgStart);
+                        dur = Math.max(0, (lastEventTs + INACTIVITY_CAP_MS) - fgStart);
                     } else {
                         dur = ts - fgStart;
                     }
@@ -205,42 +224,28 @@ public class UsageStatsHelper {
                         addTime(totalMap, fgPkg, dur);
                 }
 
-                // Start new session
-                fgPkg  = pkg;
+                fgPkg = pkg;
                 fgStart = ts;
                 lastEventTs = ts;
-            }
 
-            // ── APP BACKGROUND ───────────────────────────────────────────────
-            // Still handled for devices that fire it correctly (non-MIUI).
-            else if (type == UsageEvents.Event.MOVE_TO_BACKGROUND) {
+            } else if (type == UsageEvents.Event.MOVE_TO_BACKGROUND) {
                 if (TRANSPARENT_PACKAGES.contains(pkg)) continue;
-
                 if (pkg.equals(fgPkg)) {
                     long dur = ts - fgStart;
                     if (dur >= MIN_SESSION_MS && dur < MAX_SESSION_MS)
                         addTime(totalMap, fgPkg, dur);
-                    fgPkg  = null;
-                    fgStart = 0;
+                    fgPkg = null; fgStart = 0;
                 }
                 lastEventTs = ts;
             }
         }
 
-        // ── LIVE TOP-UP ──────────────────────────────────────────────────────
-        // The app currently open has no BACKGROUND event yet — add live time.
+        // Live top-up
         if (fgPkg != null) {
             long timeSinceLast = now - lastEventTs;
-            long sessionDur;
-
-            if (timeSinceLast > INACTIVITY_CAP_MS) {
-                // Screen likely went off without us seeing SCREEN_NON_INTERACTIVE.
-                // Only count up to INACTIVITY_CAP_MS past the last real event.
-                sessionDur = (lastEventTs + INACTIVITY_CAP_MS) - fgStart;
-            } else {
-                sessionDur = now - fgStart;
-            }
-
+            long sessionDur = timeSinceLast > INACTIVITY_CAP_MS
+                    ? (lastEventTs + INACTIVITY_CAP_MS) - fgStart
+                    : now - fgStart;
             if (sessionDur >= MIN_SESSION_MS && sessionDur < MAX_SESSION_MS)
                 addTime(totalMap, fgPkg, sessionDur);
         }
