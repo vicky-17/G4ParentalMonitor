@@ -213,7 +213,7 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 🌐 2. BROWSER HISTORY SYNC
+    // 🌐 2. BROWSER HISTORY SYNC (UPDATED - DUAL MODE)
     // =========================================================
     private final Runnable browserSyncRunnable = new Runnable() {
         @Override
@@ -223,6 +223,9 @@ public class SyncService extends Service {
         }
     };
 
+    // ══════════════════════════════════════════════════════════════════════════════
+    // ✅ UPDATED: Drains URLs from BOTH accessibility AND VPN DNS capture
+    // ══════════════════════════════════════════════════════════════════════════════
     private void syncBrowserHistory() {
         new Thread(() -> {
             if (!isNetworkAvailable()) return;

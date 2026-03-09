@@ -328,7 +328,9 @@ public class DnsVpnService extends VpnService {
         }
     }
 
-    // ── DNS packet loop ────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════════
+    // ✅ DNS packet loop (UPDATED - Records VPN domains for browser history)
+    // ══════════════════════════════════════════════════════════════════════════════
 
     private void runDnsLoop() {
         if (vpnInterface == null) return;
@@ -356,6 +358,8 @@ public class DnsVpnService extends VpnService {
                     response = DnsPacketParser.buildARecordResponse(query, ip);
                     Log.d(TAG, "🔍 SafeSearch " + query.domain + " → " + ip);
                 } else {
+                    // ✅ Allow — record domain for history sync
+                    com.example.g4parentalmonitor.logic.WebUrlDetector.recordVpnDomain(query.domain);
                     response = forwardUpstream(query, buf, len);
                 }
 

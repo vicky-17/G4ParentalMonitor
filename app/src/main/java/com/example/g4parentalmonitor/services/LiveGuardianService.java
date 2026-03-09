@@ -19,7 +19,6 @@ import android.widget.TextView;
 import com.example.g4parentalmonitor.data.PrefsManager;
 import com.example.g4parentalmonitor.logic.BlockedAppsDetector;
 import com.example.g4parentalmonitor.logic.ShortsDetector;
-import com.example.g4parentalmonitor.logic.WebUrlDetector;
 import com.example.g4parentalmonitor.utils.ScreenTimeTracker; // Ensure this matches your package
 
 public class LiveGuardianService extends AccessibilityService {
