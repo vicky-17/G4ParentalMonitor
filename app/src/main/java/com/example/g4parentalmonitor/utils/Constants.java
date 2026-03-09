@@ -3,7 +3,7 @@ package com.example.g4parentalmonitor.utils;
 public class Constants {
     // 🌍 CENTRAL SERVER URL (Dynamic - Can be updated at runtime)
     // Change this ONE place to update it everywhere
-    public static String BASE_URL = "https://fsadmin-1-5569f4ecfbc2.herokuapp.com";
+    public static String BASE_URL = "https://fsadmin-2-c3d183978587.herokuapp.com";
 
     // 🔗 API ENDPOINTS
     // We build these dynamically using BASE_URL so they never break
