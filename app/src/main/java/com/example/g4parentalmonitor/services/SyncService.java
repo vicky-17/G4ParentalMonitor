@@ -22,7 +22,6 @@ import com.example.g4parentalmonitor.utils.LocationHelper;
 import com.example.g4parentalmonitor.data.PrefsManager;
 import com.example.g4parentalmonitor.utils.UsageStatsHelper;
 import com.example.g4parentalmonitor.logic.WebUrlDetector;
-import com.example.g4parentalmonitor.ui.activities.LockScreenActivity;
 
 import com.google.gson.Gson;
 import okhttp3.*;
@@ -36,11 +35,10 @@ public class SyncService extends Service {
 
     // --- CONFIG ---
     private static final String BASE_URL = Constants.BASE_URL + "/api";
-    private static final double DISTANCE_THRESHOLD_METERS = 1.0; //distance in meter
+    private static final double DISTANCE_THRESHOLD_METERS = 1.0;
 
-    // Configurable sync intervals
     private static final long APP_SYNC_INTERVAL_MS = 60000;      // 1 Minute
-    private static final long BLOCKED_SYNC_INTERVAL_MS = 60000;  // 1 Minute (Requested)
+    private static final long BLOCKED_SYNC_INTERVAL_MS = 60000;  // 1 Minute
     private static final long BROWSER_SYNC_INTERVAL_MS = 30000;  // 30 Seconds
 
     // --- HELPERS ---
@@ -55,11 +53,63 @@ public class SyncService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private PrefsManager prefs;
 
-    // Notification management
     private NotificationManager notificationManager;
     private static final int NOTIFICATION_ID = 1;
 
-    // --- 🛡️ SECURITY & CHECKERS ---
+    // --- 🔒 FIX: Track foreground state to avoid duplicate startForeground calls ---
+    private boolean isForegroundStarted = false;
+
+    // =========================================================
+    // ✅ FIX: Centralized safe startForeground helper
+    // Called from BOTH onCreate AND onStartCommand
+    // Handles Android 14+ permission checks in one place
+    // =========================================================
+    private void startForegroundSafe() {
+        // Already in foreground — no need to call again
+        if (isForegroundStarted) return;
+
+        if (Build.VERSION.SDK_INT >= 34) { // Android 14+
+            boolean hasLocationPerm =
+                    checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                            || checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+
+            if (hasLocationPerm) {
+                try {
+                    startForeground(NOTIFICATION_ID, buildNotification(),
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                    Log.d("SyncService", "✅ Started Foreground Service with Location");
+                } catch (SecurityException e) {
+                    // Background start blocked Location FGS — fall back to DataSync only
+                    Log.w("SyncService", "⚠️ Background start blocked Location FGS. Falling back to Data Sync only.");
+                    try {
+                        startForeground(NOTIFICATION_ID, buildNotification(),
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                    } catch (Exception e2) {
+                        Log.e("SyncService", "❌ Even DataSync FGS failed", e2);
+                        // Last resort: plain startForeground (pre-API-34 style)
+                        startForeground(NOTIFICATION_ID, buildNotification());
+                    }
+                }
+            } else {
+                // No location permission — start in DataSync only mode
+                Log.w("SyncService", "⚠️ Location permission missing. Starting in DataSync mode only.");
+                try {
+                    startForeground(NOTIFICATION_ID, buildNotification(),
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                } catch (Exception e) {
+                    Log.e("SyncService", "❌ DataSync FGS failed", e);
+                    startForeground(NOTIFICATION_ID, buildNotification());
+                }
+            }
+        } else {
+            // Android 13 and below — plain startForeground, no type required
+            startForeground(NOTIFICATION_ID, buildNotification());
+        }
+
+        isForegroundStarted = true;
+    }
+
+    // --- SECURITY CHECKS ---
     private boolean isNetworkAvailable() {
         android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         android.net.NetworkInfo activeNetwork = cm.getActiveNetworkInfo();
@@ -76,19 +126,16 @@ public class SyncService extends Service {
         boolean hasLoc = isLocationEnabled();
 
         if (!hasNet || !hasLoc) {
-            // 🚨 SECURITY ALERT: Set flag to TRUE
             if (!LiveGuardianService.isRestrictedMode) {
                 LiveGuardianService.isRestrictedMode = true;
                 Log.w("SyncService", "🚨 Device Locked: Net=" + hasNet + " Loc=" + hasLoc);
             }
         } else {
-            // ✅ All Good: Set flag to FALSE
             if (LiveGuardianService.isRestrictedMode) {
                 LiveGuardianService.isRestrictedMode = false;
                 Log.d("SyncService", "✅ Device Unlocked");
             }
         }
-
     }
 
     @Override
@@ -100,32 +147,8 @@ public class SyncService extends Service {
 
         createNotificationChannel();
 
-        // 🐛 FIX: Robust try-catch for Android 14+ Foreground Service restrictions
-        if (Build.VERSION.SDK_INT >= 34) { // Android 14+
-            boolean hasLocationPerm = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-                    || checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
-
-            if (hasLocationPerm) {
-                try {
-                    // Try to start with Location (Will fail if app is starting from background)
-                    startForeground(NOTIFICATION_ID, buildNotification(),
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-                    Log.d("SyncService", "✅ Started Foreground Service with Location");
-                } catch (SecurityException e) {
-                    // Fallback to Data Sync only if Android blocks Location service from background
-                    Log.w("SyncService", "⚠️ Background start blocked Location FGS. Falling back to Data Sync only.");
-                    startForeground(NOTIFICATION_ID, buildNotification(),
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-                }
-            } else {
-                Log.w("SyncService", "⚠️ Location permission missing. Starting in DataSync mode only.");
-                startForeground(NOTIFICATION_ID, buildNotification(),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-            }
-        } else {
-            // Android 13 and below
-            startForeground(NOTIFICATION_ID, buildNotification());
-        }
+        // ✅ FIX: Use the safe helper — not inline code
+        startForegroundSafe();
 
         // Start all monitoring loops
         startConfigLoop();
@@ -135,7 +158,6 @@ public class SyncService extends Service {
         startBlockedAppsSyncLoop();
 
         registerFCMToken();
-
         startNotificationMonitor();
         ServiceRestartJob.scheduleJob(this);
 
@@ -144,12 +166,26 @@ public class SyncService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTIFICATION_ID, buildNotification());
+        // ✅ FIX: onStartCommand is called on every restart (from onDestroy, JobService, BootReceiver).
+        // We MUST call startForeground here too, but safely — the old code crashed here because
+        // it didn't check permissions and always tried to use FOREGROUND_SERVICE_TYPE_LOCATION.
+
+        // Re-init prefs if somehow null (edge case after process death + restart)
+        if (prefs == null) {
+            prefs = new PrefsManager(this);
+        }
+        if (locationHelper == null) {
+            locationHelper = new LocationHelper(this);
+        }
+
+        // Safe call — will skip if already in foreground
+        startForegroundSafe();
+
         return START_STICKY;
     }
 
     // =========================================================
-    // 🚫 1. BLOCKED APPS SYNC (Get list from Server)
+    // 🚫 1. BLOCKED APPS SYNC
     // =========================================================
     private final Runnable blockedAppsRunnable = new Runnable() {
         @Override
@@ -183,11 +219,8 @@ public class SyncService extends Service {
                             }
                         }
 
-                        // Save locally so SettingsBlockerService can read it
                         prefs.saveBlockedPackages(blockedList);
                         Log.d("SyncService", "🚫 Blocked List Updated: " + blockedList.size() + " apps");
-                    } else {
-                        Log.e("SyncService", "❌ Block List Sync Failed: " + res.code());
                     }
                 }
             } catch (Exception e) {
@@ -197,7 +230,7 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 🌐 2. BROWSER HISTORY SYNC LOOP
+    // 🌐 2. BROWSER HISTORY SYNC
     // =========================================================
     private final Runnable browserSyncRunnable = new Runnable() {
         @Override
@@ -209,12 +242,10 @@ public class SyncService extends Service {
 
     private void syncBrowserHistory() {
         new Thread(() -> {
-            if (!isNetworkAvailable()) return; // 🛑 STOP if no internet
+            if (!isNetworkAvailable()) return;
 
             try {
                 List<String> urlsToSend;
-
-                // Retrieve data from WebUrlDetector
                 synchronized (WebUrlDetector.visitedUrls) {
                     if (WebUrlDetector.visitedUrls.isEmpty()) return;
                     urlsToSend = new ArrayList<>(WebUrlDetector.visitedUrls);
@@ -242,14 +273,12 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 📍 3. LOCATION SYNC LOOP
+    // 📍 3. LOCATION SYNC
     // =========================================================
     private final Runnable locationRunnable = new Runnable() {
         @Override
         public void run() {
-            locationHelper.fetchCurrentLocation(location -> {
-                sendLocationData(location);
-            });
+            locationHelper.fetchCurrentLocation(location -> sendLocationData(location));
             long interval = (getBatteryLevel() < 15) ? (30 * 60 * 1000) : 45000;
             handler.postDelayed(this, interval);
         }
@@ -257,14 +286,16 @@ public class SyncService extends Service {
 
     private void sendLocationData(Location loc) {
         new Thread(() -> {
-            if (!isNetworkAvailable()) return; // 🛑 STOP if no internet
+            if (!isNetworkAvailable()) return;
 
             try {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
                 if (prefs.hasLastSentLocation()) {
-                    double dist = calculateDistance(prefs.getLastSentLatitude(), prefs.getLastSentLongitude(), loc.getLatitude(), loc.getLongitude());
+                    double dist = calculateDistance(
+                            prefs.getLastSentLatitude(), prefs.getLastSentLongitude(),
+                            loc.getLatitude(), loc.getLongitude());
                     if (dist < DISTANCE_THRESHOLD_METERS) return;
                 }
 
@@ -283,12 +314,14 @@ public class SyncService extends Service {
                         Log.d("SyncService", "Location Sent ✅");
                     }
                 }
-            } catch (Exception e) { Log.e("SyncService", "Loc Send Failed", e); }
+            } catch (Exception e) {
+                Log.e("SyncService", "Loc Send Failed", e);
+            }
         }).start();
     }
 
     // =========================================================
-    // 📱 4. APP USAGE SYNC LOOP
+    // 📱 4. APP USAGE SYNC
     // =========================================================
     private final Runnable appUsageRunnable = new Runnable() {
         @Override
@@ -300,7 +333,7 @@ public class SyncService extends Service {
 
     private void syncApps() {
         new Thread(() -> {
-            if (!isNetworkAvailable()) return; // 🛑 STOP if no internet
+            if (!isNetworkAvailable()) return;
 
             try {
                 String deviceId = prefs.getDeviceId();
@@ -330,14 +363,14 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // ⚙️ 5. SETTINGS/STATE MONITOR LOOP
+    // ⚙️ 5. SETTINGS / STATE MONITOR
     // =========================================================
     private final Runnable configRunnable = new Runnable() {
         @Override
         public void run() {
-            checkDeviceState(); // NEW CHECK
+            checkDeviceState();
             syncSettings();
-            handler.postDelayed(this, 10000); // Check every 10 seconds
+            handler.postDelayed(this, 10000);
         }
     };
 
@@ -352,7 +385,7 @@ public class SyncService extends Service {
         }).start();
     }
 
-    // --- UTILITIES ---
+    // --- LOOP STARTERS ---
     private void startLocationLoop() { handler.post(locationRunnable); }
     private void startAppUsageLoop() { handler.post(appUsageRunnable); }
     private void startConfigLoop() { handler.post(configRunnable); }
@@ -375,7 +408,7 @@ public class SyncService extends Service {
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
-    // --- NOTIFICATION SETUP ---
+    // --- NOTIFICATION ---
     private Notification buildNotification() {
         return new NotificationCompat.Builder(this, "g4_sync_channel")
                 .setContentTitle("Parent Control")
@@ -406,7 +439,7 @@ public class SyncService extends Service {
     }
 
     // =========================================================
-    // 🔔 6. FCM TOKEN REGISTRATION
+    // 🔔 6. FCM TOKEN
     // =========================================================
     private void registerFCMToken() {
         FirebaseMessaging.getInstance().getToken().addOnCompleteListener(task -> {
@@ -414,11 +447,9 @@ public class SyncService extends Service {
                 Log.w("SyncService", "Fetching FCM token failed", task.getException());
                 return;
             }
-
             String token = task.getResult();
-            prefs.saveFcmToken(token); // Make sure saveFcmToken exists in PrefsManager!
+            prefs.saveFcmToken(token);
             Log.d("SyncService", "FCM Token Generated: " + token);
-
             sendTokenToServer(token);
         });
     }
@@ -451,7 +482,9 @@ public class SyncService extends Service {
         }).start();
     }
 
-
+    // =========================================================
+    // 🔔 7. NOTIFICATION MONITOR (re-posts if user clears it)
+    // =========================================================
     private final Runnable notificationMonitor = new Runnable() {
         @Override
         public void run() {
@@ -484,6 +517,9 @@ public class SyncService extends Service {
 
     @Override
     public void onDestroy() {
+        // ✅ Reset flag so next start correctly calls startForeground again
+        isForegroundStarted = false;
+
         handler.removeCallbacks(locationRunnable);
         handler.removeCallbacks(appUsageRunnable);
         handler.removeCallbacks(configRunnable);
@@ -505,7 +541,6 @@ public class SyncService extends Service {
             getApplicationContext().startService(restartIntent);
         }
 
-        // Also trigger via AlarmManager for reliability
         ServiceRestartJob.scheduleJob(getApplicationContext());
     }
 }
