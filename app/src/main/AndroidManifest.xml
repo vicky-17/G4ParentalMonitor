@@ -12,10 +12,8 @@
     <uses-permission
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
-
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
-
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -26,10 +24,9 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
-
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:allowBackup="true"
@@ -41,7 +38,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.G4ParentalMonitor">
 
-
         <service
             android:name=".services.SyncService"
             android:enabled="true"
@@ -52,6 +48,15 @@
             android:name=".services.ServiceRestartJob"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="true" />
+
+        <!-- ✅ NEW: OverlayHeartbeatService -->
+        <!-- Draws 1×1 transparent overlay → MIUI shows "displaying over other apps" -->
+        <!-- indicator in status bar ONLY while truly running. Kill → indicator gone. -->
+        <service
+            android:name=".services.OverlayHeartbeatService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <activity
             android:name=".ui.activities.MainActivity"
@@ -83,16 +88,25 @@
             </intent-filter>
         </receiver>
 
+        <!-- ✅ UPDATED BootReceiver: added 6 passive wake triggers -->
         <receiver
             android:name=".receivers.BootReceiver"
             android:enabled="true"
             android:exported="true"
             android:directBootAware="true">
             <intent-filter android:priority="1000">
+                <!-- Your existing 4 actions — unchanged -->
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <!-- ✅ NEW: 6 passive wake triggers -->
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
+                <action android:name="android.intent.action.POWER_CONNECTED" />
+                <action android:name="android.intent.action.POWER_DISCONNECTED" />
+                <action android:name="android.intent.action.BATTERY_OKAY" />
+                <action android:name="android.intent.action.SCREEN_ON" />
             </intent-filter>
         </receiver>
 
@@ -122,6 +136,7 @@
             android:taskAffinity=""
             android:launchMode="singleInstance"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"/>
+
         <activity
             android:name=".ui.activities.LockScreenActivity"
             android:exported="false"
@@ -129,6 +144,27 @@
             android:launchMode="singleInstance"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
             android:screenOrientation="portrait" />
+
+        <service
+            android:name=".vpn.DnsVpnService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <!-- Required for FOREGROUND_SERVICE_TYPE_SPECIAL_USE on API 34+ -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="DNS content filtering for parental control" />
+        </service>
+
+        <!-- VpnWatchdogJob — JobScheduler watchdog that restarts VPN if killed -->
+        <service
+            android:name=".vpn.VpnWatchdogJob"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="true" />
 
     </application>
 

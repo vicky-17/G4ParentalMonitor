@@ -56,19 +56,16 @@ public class SyncService extends Service {
     private NotificationManager notificationManager;
     private static final int NOTIFICATION_ID = 1;
 
-    // --- 🔒 FIX: Track foreground state to avoid duplicate startForeground calls ---
+    // --- Track foreground state to avoid duplicate startForeground calls ---
     private boolean isForegroundStarted = false;
 
     // =========================================================
-    // ✅ FIX: Centralized safe startForeground helper
-    // Called from BOTH onCreate AND onStartCommand
-    // Handles Android 14+ permission checks in one place
+    // ✅ Centralized safe startForeground helper
     // =========================================================
     private void startForegroundSafe() {
-        // Already in foreground — no need to call again
         if (isForegroundStarted) return;
 
-        if (Build.VERSION.SDK_INT >= 34) { // Android 14+
+        if (Build.VERSION.SDK_INT >= 34) {
             boolean hasLocationPerm =
                     checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
                             || checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
@@ -79,19 +76,16 @@ public class SyncService extends Service {
                             ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
                     Log.d("SyncService", "✅ Started Foreground Service with Location");
                 } catch (SecurityException e) {
-                    // Background start blocked Location FGS — fall back to DataSync only
                     Log.w("SyncService", "⚠️ Background start blocked Location FGS. Falling back to Data Sync only.");
                     try {
                         startForeground(NOTIFICATION_ID, buildNotification(),
                                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
                     } catch (Exception e2) {
                         Log.e("SyncService", "❌ Even DataSync FGS failed", e2);
-                        // Last resort: plain startForeground (pre-API-34 style)
                         startForeground(NOTIFICATION_ID, buildNotification());
                     }
                 }
             } else {
-                // No location permission — start in DataSync only mode
                 Log.w("SyncService", "⚠️ Location permission missing. Starting in DataSync mode only.");
                 try {
                     startForeground(NOTIFICATION_ID, buildNotification(),
@@ -102,7 +96,6 @@ public class SyncService extends Service {
                 }
             }
         } else {
-            // Android 13 and below — plain startForeground, no type required
             startForeground(NOTIFICATION_ID, buildNotification());
         }
 
@@ -146,8 +139,6 @@ public class SyncService extends Service {
         notificationManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
 
         createNotificationChannel();
-
-        // ✅ FIX: Use the safe helper — not inline code
         startForegroundSafe();
 
         // Start all monitoring loops
@@ -161,26 +152,20 @@ public class SyncService extends Service {
         startNotificationMonitor();
         ServiceRestartJob.scheduleJob(this);
 
+        // ✅ NEW: Start OverlayHeartbeatService.
+        // Draws a 1×1 transparent overlay → MIUI shows "app is displaying over other
+        // apps" in the status bar ONLY while we are truly running. If MIUI kills us,
+        // the indicator vanishes — making the kill immediately visible to the parent.
+        OverlayHeartbeatService.startIfPermitted(this);
+
         Log.d("SyncService", "🚀 Service Started");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // ✅ FIX: onStartCommand is called on every restart (from onDestroy, JobService, BootReceiver).
-        // We MUST call startForeground here too, but safely — the old code crashed here because
-        // it didn't check permissions and always tried to use FOREGROUND_SERVICE_TYPE_LOCATION.
-
-        // Re-init prefs if somehow null (edge case after process death + restart)
-        if (prefs == null) {
-            prefs = new PrefsManager(this);
-        }
-        if (locationHelper == null) {
-            locationHelper = new LocationHelper(this);
-        }
-
-        // Safe call — will skip if already in foreground
+        if (prefs == null) prefs = new PrefsManager(this);
+        if (locationHelper == null) locationHelper = new LocationHelper(this);
         startForegroundSafe();
-
         return START_STICKY;
     }
 
@@ -203,8 +188,7 @@ public class SyncService extends Service {
 
                 Request req = new Request.Builder()
                         .url(BASE_URL + "/rules/blocked/" + deviceId)
-                        .get()
-                        .build();
+                        .get().build();
 
                 try (Response res = client.newCall(req).execute()) {
                     if (res.isSuccessful() && res.body() != null) {
@@ -218,7 +202,6 @@ public class SyncService extends Service {
                                 blockedList.add(array.getString(i));
                             }
                         }
-
                         prefs.saveBlockedPackages(blockedList);
                         Log.d("SyncService", "🚫 Blocked List Updated: " + blockedList.size() + " apps");
                     }
@@ -245,12 +228,11 @@ public class SyncService extends Service {
             if (!isNetworkAvailable()) return;
 
             try {
-                List<String> urlsToSend;
-                synchronized (WebUrlDetector.visitedUrls) {
-                    if (WebUrlDetector.visitedUrls.isEmpty()) return;
-                    urlsToSend = new ArrayList<>(WebUrlDetector.visitedUrls);
-                    WebUrlDetector.visitedUrls.clear();
-                }
+                // ✅ NEW: Drain from BOTH accessibility AND VPN DNS capture
+                List<String> urlsToSend = com.example.g4parentalmonitor.logic.WebUrlDetector.drainAllUrls();
+
+                if (urlsToSend.isEmpty()) return;
+
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
 
@@ -263,7 +245,7 @@ public class SyncService extends Service {
 
                 try (Response res = client.newCall(req).execute()) {
                     if (res.isSuccessful()) {
-                        Log.d("SyncService", "✅ Browser History Synced (" + urlsToSend.size() + ")");
+                        Log.d("SyncService", "✅ Browser History Synced (" + urlsToSend.size() + " entries from both sources)");
                     }
                 }
             } catch (Exception e) {
@@ -287,7 +269,6 @@ public class SyncService extends Service {
     private void sendLocationData(Location loc) {
         new Thread(() -> {
             if (!isNetworkAvailable()) return;
-
             try {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
@@ -334,7 +315,6 @@ public class SyncService extends Service {
     private void syncApps() {
         new Thread(() -> {
             if (!isNetworkAvailable()) return;
-
             try {
                 String deviceId = prefs.getDeviceId();
                 if (deviceId == null) return;
@@ -386,10 +366,10 @@ public class SyncService extends Service {
     }
 
     // --- LOOP STARTERS ---
-    private void startLocationLoop() { handler.post(locationRunnable); }
-    private void startAppUsageLoop() { handler.post(appUsageRunnable); }
-    private void startConfigLoop() { handler.post(configRunnable); }
-    private void startBrowserSyncLoop() { handler.post(browserSyncRunnable); }
+    private void startLocationLoop()        { handler.post(locationRunnable); }
+    private void startAppUsageLoop()        { handler.post(appUsageRunnable); }
+    private void startConfigLoop()          { handler.post(configRunnable); }
+    private void startBrowserSyncLoop()     { handler.post(browserSyncRunnable); }
     private void startBlockedAppsSyncLoop() { handler.post(blockedAppsRunnable); }
     private void startNotificationMonitor() { handler.post(notificationMonitor); }
 
@@ -402,9 +382,9 @@ public class SyncService extends Service {
         final int R = 6371000;
         double dLat = Math.toRadians(lat2 - lat1);
         double dLon = Math.toRadians(lon2 - lon1);
-        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
-                        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                * Math.sin(dLon / 2) * Math.sin(dLon / 2);
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
@@ -423,16 +403,12 @@ public class SyncService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                    "g4_sync_channel",
-                    "Parent Control Service",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+                    "g4_sync_channel", "Parent Control Service", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("Monitors app usage and location");
             channel.setShowBadge(false);
             channel.enableVibration(false);
             channel.enableLights(false);
             channel.setSound(null, null);
-
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
         }
@@ -467,14 +443,11 @@ public class SyncService extends Service {
 
                 RequestBody body = RequestBody.create(gson.toJson(payload), MediaType.get("application/json"));
                 Request req = new Request.Builder()
-                        .url(BASE_URL + "/devices/update-token")
-                        .post(body)
-                        .build();
+                        .url(BASE_URL + "/devices/update-token").post(body).build();
 
                 try (Response res = client.newCall(req).execute()) {
-                    if (res.isSuccessful()) {
+                    if (res.isSuccessful())
                         Log.d("SyncService", "✅ FCM Token sent to server successfully.");
-                    }
                 }
             } catch (Exception e) {
                 Log.e("SyncService", "❌ Failed to send FCM token", e);
@@ -493,12 +466,8 @@ public class SyncService extends Service {
                     boolean notificationExists = false;
                     android.service.notification.StatusBarNotification[] activeNotifications =
                             notificationManager.getActiveNotifications();
-
                     for (android.service.notification.StatusBarNotification sbn : activeNotifications) {
-                        if (sbn.getId() == NOTIFICATION_ID) {
-                            notificationExists = true;
-                            break;
-                        }
+                        if (sbn.getId() == NOTIFICATION_ID) { notificationExists = true; break; }
                     }
                     if (!notificationExists) {
                         Log.d("SyncService", "⚠️ Notification cleared. Re-showing...");
@@ -517,7 +486,6 @@ public class SyncService extends Service {
 
     @Override
     public void onDestroy() {
-        // ✅ Reset flag so next start correctly calls startForeground again
         isForegroundStarted = false;
 
         handler.removeCallbacks(locationRunnable);

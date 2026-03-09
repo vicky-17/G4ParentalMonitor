@@ -48,13 +48,12 @@ public class PrefsManager {
     }
 
     public long getLocationInterval() { return prefs.getLong("locationInterval", 60000); }
-    public long getAppSyncInterval() { return prefs.getLong("appSyncInterval", 120000); } // Default 2 mins
+    public long getAppSyncInterval() { return prefs.getLong("appSyncInterval", 120000); }
     public long getLastModified() { return prefs.getLong("lastModified", 0); }
 
     // --- RULE STORAGE ---
     public void saveAppRules(List<AppRule> rules) {
-        String json = gson.toJson(rules);
-        prefs.edit().putString("appRulesJson", json).apply();
+        prefs.edit().putString("appRulesJson", gson.toJson(rules)).apply();
     }
 
     public List<AppRule> getAppRules() {
@@ -63,7 +62,7 @@ public class PrefsManager {
         return gson.fromJson(json, type);
     }
 
-    // --- LAST SENT LOCATION (For Smart Triggers) ---
+    // --- LAST SENT LOCATION ---
     public void saveLastSentLocation(double latitude, double longitude) {
         prefs.edit()
                 .putString("lastSentLat", String.valueOf(latitude))
@@ -85,8 +84,7 @@ public class PrefsManager {
         return prefs.contains("lastSentLat") && prefs.contains("lastSentLng");
     }
 
-    // --- BLOCKED APPS STORAGE ---
-    // We use a Set for O(1) fast lookup in the accessibility service
+    // --- BLOCKED APPS ---
     public void saveBlockedPackages(List<String> packageNames) {
         Set<String> set = new HashSet<>(packageNames);
         prefs.edit().putStringSet("blocked_packages_set", set).apply();
@@ -97,14 +95,10 @@ public class PrefsManager {
         return set.contains(packageName);
     }
 
-    // --- BLOCKED LISTS (Legacy - Keep if needed elsewhere) ---
     public void saveBlockedLists(List<String> apps, List<String> urls) {
-        String appsJson = gson.toJson(apps);
-        String urlsJson = gson.toJson(urls);
-
         prefs.edit()
-                .putString("blockedApps", appsJson)
-                .putString("blockedUrls", urlsJson)
+                .putString("blockedApps", gson.toJson(apps))
+                .putString("blockedUrls", gson.toJson(urls))
                 .apply();
     }
 
@@ -124,12 +118,7 @@ public class PrefsManager {
         return prefs.contains("blockedApps") && prefs.contains("blockedUrls");
     }
 
-
-
-    // ==========================================
-    // --- GLOBAL SETTINGS (Web Dashboard Sync) ---
-    // ==========================================
-
+    // --- GLOBAL SETTINGS ---
     public void saveGlobalSettings(boolean liveTracking, boolean uninstallProtection, boolean blockShorts) {
         prefs.edit()
                 .putBoolean("liveTracking", liveTracking)
@@ -138,27 +127,76 @@ public class PrefsManager {
                 .apply();
     }
 
-    public boolean isLiveTrackingEnabled() {
-        // Defaults to true so it works immediately before the first sync
-        return prefs.getBoolean("liveTracking", false);
+    public boolean isLiveTrackingEnabled() { return prefs.getBoolean("liveTracking", false); }
+    public boolean isUninstallProtectionEnabled() { return prefs.getBoolean("uninstallProtection", true); }
+    public boolean isBlockShortsEnabled() { return prefs.getBoolean("blockShorts", true); }
+
+    public void saveFcmToken(String token) { prefs.edit().putString("fcmToken", token).apply(); }
+    public String getFcmToken() { return prefs.getString("fcmToken", null); }
+
+    // ======================================================================
+    // --- VPN / DNS FILTER SETTINGS (NEW) ---
+    // ======================================================================
+
+    private static final String KEY_VPN_FILTER_ENABLED      = "vpnFilterEnabled";
+    private static final String KEY_VPN_SAFE_SEARCH_ENABLED = "vpnSafeSearchEnabled";
+    private static final String KEY_VPN_BLOCK_ADULT         = "vpnBlockAdult";
+    private static final String KEY_VPN_KEEP_ALIVE          = "vpnKeepAlive";
+    private static final String KEY_VPN_PREVENT_OVERRIDE    = "vpnPreventOverride";
+    private static final String KEY_VPN_HEARTBEAT_STATE     = "vpnHeartbeatState";
+    private static final String KEY_VPN_HEARTBEAT_TIME      = "vpnHeartbeatTime";
+
+    /** Master switch — user wants the VPN DNS filter ON */
+    public boolean isVpnFilterEnabled() {
+        return prefs.getBoolean(KEY_VPN_FILTER_ENABLED, false);
+    }
+    public void setVpnFilterEnabled(boolean enabled) {
+        prefs.edit().putBoolean(KEY_VPN_FILTER_ENABLED, enabled).apply();
     }
 
-    public boolean isUninstallProtectionEnabled() {
-        // Defaults to false so the parent doesn't get locked out by accident
-        return prefs.getBoolean("uninstallProtection", true);
+    /** Redirect Google/YouTube/Bing to SafeSearch IPs */
+    public boolean isVpnSafeSearchEnabled() {
+        return prefs.getBoolean(KEY_VPN_SAFE_SEARCH_ENABLED, true);
+    }
+    public void setVpnSafeSearchEnabled(boolean enabled) {
+        prefs.edit().putBoolean(KEY_VPN_SAFE_SEARCH_ENABLED, enabled).apply();
     }
 
-    public boolean isBlockShortsEnabled() {
-        return prefs.getBoolean("blockShorts", true);
+    /** Block adult/harmful domains via NXDOMAIN */
+    public boolean isVpnBlockAdultEnabled() {
+        return prefs.getBoolean(KEY_VPN_BLOCK_ADULT, true);
+    }
+    public void setVpnBlockAdultEnabled(boolean enabled) {
+        prefs.edit().putBoolean(KEY_VPN_BLOCK_ADULT, enabled).apply();
     }
 
-
-    public void saveFcmToken(String token) {
-        prefs.edit().putString("fcmToken", token).apply();
+    /** Keep VPN alive with probe + watchdog */
+    public boolean isKeepVpnAlive() {
+        return prefs.getBoolean(KEY_VPN_KEEP_ALIVE, true);
     }
-    public String getFcmToken() {
-        return prefs.getString("fcmToken", null);
+    public void setKeepVpnAlive(boolean enabled) {
+        prefs.edit().putBoolean(KEY_VPN_KEEP_ALIVE, enabled).apply();
     }
 
+    /** Restart immediately when another VPN tries to displace ours */
+    public boolean isPreventVpnOverride() {
+        return prefs.getBoolean(KEY_VPN_PREVENT_OVERRIDE, true);
+    }
+    public void setPreventVpnOverride(boolean enabled) {
+        prefs.edit().putBoolean(KEY_VPN_PREVENT_OVERRIDE, enabled).apply();
+    }
 
+    /** Written by DnsVpnService every 7 min; read by VpnWatchdogJob */
+    public void setVpnHeartbeat(String state, long timestamp) {
+        prefs.edit()
+                .putString(KEY_VPN_HEARTBEAT_STATE, state)
+                .putLong(KEY_VPN_HEARTBEAT_TIME, timestamp)
+                .apply();
+    }
+    public String getVpnHeartbeatState() {
+        return prefs.getString(KEY_VPN_HEARTBEAT_STATE, "UNKNOWN");
+    }
+    public long getVpnHeartbeatTime() {
+        return prefs.getLong(KEY_VPN_HEARTBEAT_TIME, 0);
+    }
 }

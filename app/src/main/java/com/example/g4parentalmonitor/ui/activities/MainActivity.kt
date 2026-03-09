@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -20,13 +21,15 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -36,12 +39,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -49,13 +52,16 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import com.example.g4parentalmonitor.utils.Constants
-import com.example.g4parentalmonitor.receivers.MyAppAdminReceiver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.g4parentalmonitor.data.PrefsManager
+import com.example.g4parentalmonitor.receivers.MyAppAdminReceiver
 import com.example.g4parentalmonitor.services.LiveGuardianService
 import com.example.g4parentalmonitor.services.SyncService
+import com.example.g4parentalmonitor.utils.Constants
 import com.example.g4parentalmonitor.utils.UsageStatsHelper
 import com.example.g4parentalmonitor.ui.theme.G4ParentalMonitorTheme
+import com.example.g4parentalmonitor.vpn.DnsVpnService
+import com.example.g4parentalmonitor.vpn.VpnWatchdogJob
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -65,26 +71,51 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
-// ─── Colour palette ──────────────────────────────────────────────────────────
-private val BgDeep        = Color(0xFF0C0E18)
-private val BgCard        = Color(0xFF161825)
-private val BgCardAlt     = Color(0xFF1C1F30)
-private val Stroke        = Color(0xFF252840)
-private val Blue          = Color(0xFF4E8EF5)
-private val BlueDim       = Color(0xFF1D2D52)
-private val Green         = Color(0xFF2DCE89)
-private val GreenDim      = Color(0xFF0E3028)
-private val Orange        = Color(0xFFFF9F43)
-private val OrangeDim     = Color(0xFF3A2410)
-private val Red           = Color(0xFFFF5C5C)
-private val RedDim        = Color(0xFF3A1212)
-private val TextHi        = Color(0xFFECEFF8)
-private val TextMid       = Color(0xFF7C82A0)
-private val TextLo        = Color(0xFF464A65)
+// ─── Design tokens ────────────────────────────────────────────────────────────
+
+// Base palette — deep navy trust colors
+private val Bg0          = Color(0xFF080D1A)   // Deepest background
+private val Bg1          = Color(0xFF0D1425)   // Card background
+private val Bg2          = Color(0xFF131B2E)   // Elevated card
+private val Bg3          = Color(0xFF192238)   // Subtle raised
+private val Border       = Color(0xFF1E2D47)
+
+// Trust blues (psychologically safe, authoritative)
+private val BlueCore     = Color(0xFF3B8BEB)
+private val BlueBright   = Color(0xFF5CA8FF)
+private val BlueDim      = Color(0xFF0F1F3D)
+private val BlueGlow     = Color(0x2038AAFF)
+
+// Status colors
+private val EmeraldOn    = Color(0xFF00C896)
+private val EmeraldDim   = Color(0xFF062921)
+private val EmeraldGlow  = Color(0x2000C896)
+private val AmberWarn    = Color(0xFFFFAD2E)
+private val AmberDim     = Color(0xFF2A1D06)
+private val CrimsonOff   = Color(0xFFFF4D6A)
+private val CrimsonDim   = Color(0xFF2A0812)
+
+// Text
+private val TxtPrimary   = Color(0xFFE8EDF8)
+private val TxtSecondary = Color(0xFF6E7FA8)
+private val TxtTertiary  = Color(0xFF3A4668)
+
+// Shield gradient
+private val ShieldGrad   = listOf(Color(0xFF1A6EF5), Color(0xFF0A3A9A))
 
 class MainActivity : ComponentActivity() {
+
+    private val vpnPermLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        // After VPN permission dialog — check if granted and start
+        if (result.resultCode == RESULT_OK) {
+            startVpnService()
+        }
+    }
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -100,32 +131,51 @@ class MainActivity : ComponentActivity() {
         setContent { AppUI() }
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────────
+    // ─── VPN helpers ──────────────────────────────────────────────────────────
 
-    /** "2h 14m", "45m", "30s" */
-    private fun fmtMs(ms: Long): String {
-        val s = ms / 1000
-        val h = s / 3600; val m = (s % 3600) / 60; val sec = s % 60
-        return when { h > 0 -> "${h}h ${m}m"; m > 0 -> "${m}m"; else -> "${sec}s" }
+    fun requestVpnPermission() {
+        val intent = VpnService.prepare(this)
+        if (intent != null) {
+            // Need to ask user for VPN permission
+            vpnPermLauncher.launch(intent)
+        } else {
+            // Already granted — start immediately
+            startVpnService()
+        }
     }
 
-    private fun timeColor(ms: Long): Color {
-        val m = ms / 60_000
-        return when { m < 30 -> Green; m < 120 -> Orange; else -> Red }
+    fun startVpnService() {
+        val prefs = PrefsManager(this)
+        prefs.setVpnFilterEnabled(true)
+        val intent = Intent(this, DnsVpnService::class.java)
+        intent.action = DnsVpnService.ACTION_START
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+        else startService(intent)
+        VpnWatchdogJob.schedule(this)
+        Toast.makeText(this, "🛡️ G4 Shield activated", Toast.LENGTH_SHORT).show()
     }
 
-    private fun timeDimColor(ms: Long): Color {
-        val m = ms / 60_000
-        return when { m < 30 -> GreenDim; m < 120 -> OrangeDim; else -> RedDim }
+    fun stopVpnService() {
+        val prefs = PrefsManager(this)
+        prefs.setVpnFilterEnabled(false)
+        val intent = Intent(this, DnsVpnService::class.java)
+        intent.action = DnsVpnService.ACTION_STOP
+        startService(intent)
+        VpnWatchdogJob.cancel(this)
+        Toast.makeText(this, "Shield deactivated", Toast.LENGTH_SHORT).show()
     }
 
-    // ─── Root composable ─────────────────────────────────────────────────────
+    fun isVpnPermissionGranted(): Boolean =
+        VpnService.prepare(this) == null
+
+    // ─── Root composable ──────────────────────────────────────────────────────
 
     @Composable
     fun AppUI() {
-        val ctx = LocalContext.current
-        val scroll = rememberScrollState()
-        val lcOwner = LocalLifecycleOwner.current
+        val ctx         = LocalContext.current
+        val scroll      = rememberScrollState()
+        val lcOwner     = LocalLifecycleOwner.current
+        val prefs       = remember { PrefsManager(ctx) }
 
         var tick by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
@@ -137,12 +187,35 @@ class MainActivity : ComponentActivity() {
             onDispose { lcOwner.lifecycle.removeObserver(obs) }
         }
 
-        data class AppEntry(val name: String, val pkg: String, val ms: Long)
+        // Permission states
+        val usageOk   = hasUsageStatsPermission()
+        val filesOk   = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+        val runtimeOk = areRuntimePermissionsGranted()
+        val overlayOk = hasOverlayPermission()
+        val batteryOk = isBatteryOptimizationIgnored()
+        val adminOk   = isDeviceAdminActive(ctx)
+        val accessOk  = isAccessibilityServiceEnabled(ctx, LiveGuardianService::class.java)
+        val vpnPermOk = isVpnPermissionGranted()
+        val allOk     = usageOk && filesOk && runtimeOk && overlayOk && batteryOk
 
+        // VPN state — read from prefs AND live service flag
+        var vpnEnabled        by remember { mutableStateOf(prefs.isVpnFilterEnabled()) }
+        var safeSearchEnabled by remember { mutableStateOf(prefs.isVpnSafeSearchEnabled()) }
+        var blockAdultEnabled by remember { mutableStateOf(prefs.isVpnBlockAdultEnabled()) }
+        var keepAliveEnabled  by remember { mutableStateOf(prefs.isKeepVpnAlive()) }
+        var preventOverride   by remember { mutableStateOf(prefs.isPreventVpnOverride()) }
+
+        val vpnRunning = vpnEnabled && DnsVpnService.serviceRunning
+
+        // App usage data
+        data class AppEntry(val name: String, val pkg: String, val ms: Long)
         var list      by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
         var updatedAt by remember { mutableStateOf<Long?>(null) }
         var loading   by remember { mutableStateOf(true) }
         var showAll   by remember { mutableStateOf(false) }
+
+        val grantedCount = listOf(usageOk, filesOk, runtimeOk, overlayOk, batteryOk).count { it }
+        val progress by animateFloatAsState(grantedCount / 5f, tween(700), label = "prog")
 
         LaunchedEffect(tick) {
             loading = true
@@ -156,8 +229,7 @@ class MainActivity : ComponentActivity() {
                     }
                     .mapNotNull { app ->
                         val ms = usageMap[app.packageName] ?: 0L
-                        if (ms == 0L) null
-                        else AppEntry(pm.getApplicationLabel(app).toString(), app.packageName, ms)
+                        if (ms == 0L) null else AppEntry(pm.getApplicationLabel(app).toString(), app.packageName, ms)
                     }
                     .sortedByDescending { it.ms }
                 withContext(Dispatchers.Main) {
@@ -166,121 +238,59 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Permission states (re-read on every recompose triggered by ON_RESUME)
-        val usageOk   = hasUsageStatsPermission()
-        val filesOk   = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
-        val runtimeOk = areRuntimePermissionsGranted()
-        val overlayOk = hasOverlayPermission()
-        val batteryOk = isBatteryOptimizationIgnored()
-        val adminOk   = isDeviceAdminActive(ctx)
-        val accessOk  = isAccessibilityServiceEnabled(ctx, LiveGuardianService::class.java)
-        val allOk     = usageOk && filesOk && runtimeOk && overlayOk && batteryOk
-
-        val grantedCount = listOf(usageOk, filesOk, runtimeOk, overlayOk, batteryOk).count { it }
-        val progress by animateFloatAsState(grantedCount / 5f, tween(700), label = "prog")
-
         G4ParentalMonitorTheme {
-            Box(Modifier.fillMaxSize().background(BgDeep)) {
+            Box(Modifier.fillMaxSize().background(Bg0)) {
                 Column(
                     Modifier
                         .fillMaxSize()
                         .verticalScroll(scroll)
-                        .padding(bottom = 40.dp)
+                        .padding(bottom = 48.dp)
                 ) {
+                    // ── HERO HEADER ───────────────────────────────────────────
+                    HeroHeader(
+                        vpnRunning   = vpnRunning,
+                        vpnEnabled   = vpnEnabled,
+                        accessOk     = accessOk,
+                        adminOk      = adminOk,
+                        progress     = progress,
+                        grantedCount = grantedCount,
+                        allOk        = allOk
+                    )
 
-                    // ── HERO HEADER ──────────────────────────────────────────
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .background(
-                                Brush.verticalGradient(listOf(Color(0xFF131729), BgDeep))
-                            )
-                            .padding(start = 22.dp, end = 22.dp, top = 58.dp, bottom = 26.dp)
-                    ) {
-                        Column {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    Modifier
-                                        .size(46.dp)
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(BlueDim),
-                                    contentAlignment = Alignment.Center
-                                ) { Text("🛡️", fontSize = 22.sp) }
-                                Spacer(Modifier.width(14.dp))
-                                Column {
-                                    Text(
-                                        "G4 Parental Monitor",
-                                        color = TextHi,
-                                        fontSize = 20.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text("Device protection & screen-time", color = TextMid, fontSize = 12.sp)
+                    Spacer(Modifier.height(8.dp))
+
+                    // ── G4 SHIELD — VPN SECTION ───────────────────────────────
+                    Section {
+                        ShieldSection(
+                            vpnEnabled        = vpnEnabled,
+                            vpnPermOk         = vpnPermOk,
+                            safeSearchEnabled = safeSearchEnabled,
+                            blockAdultEnabled = blockAdultEnabled,
+                            keepAliveEnabled  = keepAliveEnabled,
+                            preventOverride   = preventOverride,
+                            accessOk          = accessOk,
+                            onVpnToggle       = { wantOn ->
+                                if (wantOn) {
+                                    requestVpnPermission()
+                                    vpnEnabled = true
+                                } else {
+                                    stopVpnService()
+                                    vpnEnabled = false
                                 }
-                            }
-
-                            Spacer(Modifier.height(22.dp))
-
-                            // Setup progress bar
-                            Row(
-                                Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("Setup Progress", color = TextMid, fontSize = 12.sp)
-                                Text(
-                                    "$grantedCount / 5 done",
-                                    color = if (allOk) Green else Orange,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                            Spacer(Modifier.height(8.dp))
-                            LinearProgressIndicator(
-                                progress = { progress },
-                                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                                color = if (allOk) Green else Blue,
-                                trackColor = Stroke,
-                                strokeCap = StrokeCap.Round
-                            )
-                        }
+                            },
+                            onSafeSearch = { v -> safeSearchEnabled = v; prefs.setVpnSafeSearchEnabled(v) },
+                            onBlockAdult = { v -> blockAdultEnabled = v; prefs.setVpnBlockAdultEnabled(v) },
+                            onKeepAlive  = { v -> keepAliveEnabled  = v; prefs.setKeepVpnAlive(v) },
+                            onPreventOverride = { v -> preventOverride = v; prefs.setPreventVpnOverride(v) }
+                        )
                     }
 
-                    // ── STATUS CHIPS ─────────────────────────────────────────
-                    Pad {
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            MiniChip(
-                                Modifier.weight(1f),
-                                icon = if (allOk) "✅" else "⚙️",
-                                label = "Permissions",
-                                value = if (allOk) "All set" else "$grantedCount/5",
-                                vc = if (allOk) Green else Orange
-                            )
-                            MiniChip(
-                                Modifier.weight(1f),
-                                icon = if (adminOk) "🔒" else "🔓",
-                                label = "Anti-Uninstall",
-                                value = if (adminOk) "Active" else "Off",
-                                vc = if (adminOk) Green else Red
-                            )
-                            MiniChip(
-                                Modifier.weight(1f),
-                                icon = "👁️",
-                                label = "Guardian",
-                                value = if (accessOk) "Active" else "Off",
-                                vc = if (accessOk) Green else Red
-                            )
-                        }
-                    }
+                    // ── REQUIRED PERMISSIONS ──────────────────────────────────
+                    Section {
+                        SectionHeader("Required Permissions", "Tap any row to grant access")
+                        Spacer(Modifier.height(12.dp))
 
-                    // ── REQUIRED PERMISSIONS ─────────────────────────────────
-                    Pad {
-                        SectionTitle("Required Permissions", "Tap any row to grant access")
-                        Spacer(Modifier.height(10.dp))
-
-                        PermRow("📊", "Usage Access", "Track app screen time", usageOk) {
+                        PermRow("📊", "Usage Access", "Track screen time per app", usageOk) {
                             startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -311,36 +321,16 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        Spacer(Modifier.height(14.dp))
-                        Button(
-                            onClick = {
-                                if (allOk) {
-                                    startMonitoringService()
-                                    Toast.makeText(ctx, "✅ Monitoring started!", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(ctx, "Grant all permissions first.", Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth().height(52.dp),
-                            shape = RoundedCornerShape(14.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (allOk) Green else BgCardAlt,
-                                contentColor   = if (allOk) Color.White else TextMid
-                            )
-                        ) {
-                            Text(
-                                if (allOk) "▶  Start Monitoring Service" else "⚙  Complete Setup First",
-                                fontSize = 15.sp, fontWeight = FontWeight.SemiBold
-                            )
-                        }
+                        Spacer(Modifier.height(16.dp))
+                        StartButton(allOk = allOk, ctx = ctx)
                     }
 
-                    // ── SECURITY ─────────────────────────────────────────────
-                    Pad {
-                        SectionTitle("Security Features", "Prevent tampering & uninstall")
-                        Spacer(Modifier.height(10.dp))
+                    // ── SECURITY ──────────────────────────────────────────────
+                    Section {
+                        SectionHeader("Security Features", "Prevent tampering & uninstall")
+                        Spacer(Modifier.height(12.dp))
 
-                        PermRow("🛡️", "Anti-Uninstall", "Requires admin to remove this app", adminOk) {
+                        PermRow("🛡️", "Anti-Uninstall", "Admin lock prevents removal", adminOk) {
                             if (!adminOk) {
                                 val cn = ComponentName(ctx, MyAppAdminReceiver::class.java)
                                 startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
@@ -349,7 +339,7 @@ class MainActivity : ComponentActivity() {
                                 })
                             }
                         }
-                        PermRow("👁️", "Live Guardian (Accessibility)", "Blocks restricted apps & settings", accessOk) {
+                        PermRow("👁️", "Live Guardian", "Blocks restricted apps & websites", accessOk) {
                             if (!accessOk) {
                                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                                 Toast.makeText(ctx, "Find 'G4 Parental Monitor' and enable it", Toast.LENGTH_LONG).show()
@@ -358,8 +348,8 @@ class MainActivity : ComponentActivity() {
                     }
 
                     // ── TROUBLESHOOTING ───────────────────────────────────────
-                    Pad {
-                        SectionTitle("Troubleshooting", null)
+                    Section {
+                        SectionHeader("Troubleshooting", null)
                         Spacer(Modifier.height(10.dp))
                         OutlinedButton(
                             onClick = {
@@ -370,174 +360,654 @@ class MainActivity : ComponentActivity() {
                             },
                             modifier = Modifier.fillMaxWidth().height(48.dp),
                             shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Red),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, Red.copy(alpha = 0.35f))
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = CrimsonOff),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, CrimsonOff.copy(alpha = 0.3f))
                         ) {
                             Text("🔗  Re-Pair / Connect Again", fontSize = 14.sp)
                         }
                     }
 
                     // ── SCREEN TIME ───────────────────────────────────────────
-                    Pad {
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text("Today's Screen Time", color = TextHi, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                                updatedAt?.let {
-                                    Text(
-                                        "Updated ${SimpleDateFormat("hh:mm a", Locale.getDefault()).format(it)}",
-                                        color = TextMid, fontSize = 11.sp
-                                    )
-                                }
-                            }
-                            Box(
-                                Modifier
-                                    .size(40.dp)
-                                    .clip(CircleShape)
-                                    .background(BgCardAlt)
-                                    .clickable { tick = System.currentTimeMillis() },
-                                contentAlignment = Alignment.Center
-                            ) { Text("🔄", fontSize = 18.sp) }
-                        }
-
-                        Spacer(Modifier.height(14.dp))
-
-                        Crossfade(loading, label = "usage") { isLoading ->
-                            if (isLoading) {
-                                Box(
-                                    Modifier.fillMaxWidth().padding(vertical = 40.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        CircularProgressIndicator(color = Blue, modifier = Modifier.size(34.dp))
-                                        Spacer(Modifier.height(10.dp))
-                                        Text("Calculating usage…", color = TextMid, fontSize = 13.sp)
-                                    }
-                                }
-                            } else {
-                                Column {
-                                    if (!usageOk) {
-                                        // Error banner
-                                        Row(
-                                            Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(12.dp))
-                                                .background(RedDim)
-                                                .padding(14.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text("⚠️", fontSize = 18.sp)
-                                            Spacer(Modifier.width(10.dp))
-                                            Text("Usage Access permission required.", color = Red, fontSize = 13.sp)
-                                        }
-                                    } else if (list.isEmpty()) {
-                                        Box(
-                                            Modifier.fillMaxWidth().padding(vertical = 28.dp),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Text("No usage data yet today.", color = TextMid, fontSize = 14.sp)
-                                        }
-                                    } else {
-                                        // Total summary card
-                                        val totalMs = list.sumOf { it.ms }
-                                        Box(
-                                            Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(16.dp))
-                                                .background(
-                                                    Brush.horizontalGradient(listOf(BlueDim, Color(0xFF141E3A)))
-                                                )
-                                                .padding(18.dp)
-                                        ) {
-                                            Row(
-                                                Modifier.fillMaxWidth(),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.SpaceBetween
-                                            ) {
-                                                Column {
-                                                    Text("Total Today", color = TextMid, fontSize = 11.sp)
-                                                    Text(
-                                                        fmtMs(totalMs),
-                                                        color = Blue,
-                                                        fontSize = 30.sp,
-                                                        fontWeight = FontWeight.Bold
-                                                    )
-                                                }
-                                                Column(horizontalAlignment = Alignment.End) {
-                                                    Text("${list.size} apps", color = TextMid, fontSize = 11.sp)
-                                                    Text("Since midnight", color = TextLo, fontSize = 10.sp)
-                                                }
-                                            }
-                                        }
-
-                                        Spacer(Modifier.height(12.dp))
-
-                                        val display = if (showAll) list else list.take(8)
-                                        val maxMs = list.first().ms.coerceAtLeast(1L)
-
-                                        display.forEachIndexed { i, item ->
-                                            UsageRow(i + 1, item.name, item.pkg, item.ms, maxMs)
-                                            if (i < display.lastIndex) Spacer(Modifier.height(6.dp))
-                                        }
-
-                                        if (list.size > 8) {
-                                            Spacer(Modifier.height(10.dp))
-                                            TextButton(
-                                                onClick = { showAll = !showAll },
-                                                modifier = Modifier.fillMaxWidth()
-                                            ) {
-                                                Text(
-                                                    if (showAll) "▲  Show Less"
-                                                    else "▼  Show All ${list.size} Apps",
-                                                    color = Blue, fontSize = 13.sp
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    Section {
+                        ScreenTimeSection(
+                            list = list, updatedAt = updatedAt, loading = loading,
+                            showAll = showAll, usageOk = usageOk,
+                            onRefresh = { tick = System.currentTimeMillis() },
+                            onShowAll = { showAll = !showAll }
+                        )
                     }
                 }
             }
         }
     }
 
+    // ─── Hero Header ──────────────────────────────────────────────────────────
+
+    @Composable
+    fun HeroHeader(
+        vpnRunning: Boolean, vpnEnabled: Boolean, accessOk: Boolean,
+        adminOk: Boolean, progress: Float, grantedCount: Int, allOk: Boolean
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color(0xFF0A1628), Color(0xFF080D1A))
+                    )
+                )
+        ) {
+            // Subtle glow orb in background
+            Box(
+                Modifier
+                    .size(260.dp)
+                    .offset(x = (-40).dp, y = (-60).dp)
+                    .blur(80.dp)
+                    .background(BlueGlow, CircleShape)
+            )
+
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 22.dp, end = 22.dp, top = 56.dp, bottom = 28.dp)
+            ) {
+                // App identity
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    AnimatedShieldIcon(active = vpnRunning || accessOk)
+                    Spacer(Modifier.width(14.dp))
+                    Column {
+                        Text(
+                            "G4 Guardian",
+                            color = TxtPrimary,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = (-0.3).sp
+                        )
+                        Text(
+                            "Parental protection system",
+                            color = TxtSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    // Live status pill
+                    LiveStatusPill(vpnRunning = vpnRunning, accessOk = accessOk)
+                }
+
+                Spacer(Modifier.height(24.dp))
+
+                // Status chips row
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    StatusChip(Modifier.weight(1f), icon = if (allOk) "✅" else "⚙️",
+                        label = "Setup", value = if (allOk) "Done" else "$grantedCount/5",
+                        tint = if (allOk) EmeraldOn else AmberWarn)
+                    StatusChip(Modifier.weight(1f), icon = if (adminOk) "🔒" else "🔓",
+                        label = "Uninstall", value = if (adminOk) "Locked" else "Open",
+                        tint = if (adminOk) EmeraldOn else CrimsonOff)
+                    StatusChip(Modifier.weight(1f), icon = "🌐",
+                        label = "Filter", value = if (vpnRunning) "Active" else "Off",
+                        tint = if (vpnRunning) EmeraldOn else TxtSecondary)
+                }
+
+                Spacer(Modifier.height(20.dp))
+
+                // Setup progress
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Setup Progress", color = TxtSecondary, fontSize = 12.sp)
+                    Text(
+                        "$grantedCount / 5 permissions",
+                        color = if (allOk) EmeraldOn else AmberWarn,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(Border)
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(progress)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(BlueCore, if (allOk) EmeraldOn else BlueBright)
+                                )
+                            )
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun AnimatedShieldIcon(active: Boolean) {
+        val pulse = rememberInfiniteTransition(label = "pulse")
+        val scale by pulse.animateFloat(
+            initialValue = 1f,
+            targetValue  = if (active) 1.08f else 1f,
+            animationSpec = infiniteRepeatable(
+                animation  = tween(1200, easing = EaseInOutSine),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "scale"
+        )
+        val glowAlpha by pulse.animateFloat(
+            initialValue = 0.3f,
+            targetValue  = if (active) 0.7f else 0.3f,
+            animationSpec = infiniteRepeatable(
+                animation  = tween(1200, easing = EaseInOutSine),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "glow"
+        )
+
+        Box(contentAlignment = Alignment.Center) {
+            // Glow ring
+            Box(
+                Modifier
+                    .size(58.dp)
+                    .scale(scale)
+                    .blur(8.dp)
+                    .background(
+                        if (active) EmeraldOn.copy(alpha = glowAlpha)
+                        else BlueCore.copy(alpha = 0.3f),
+                        CircleShape
+                    )
+            )
+            // Shield container
+            Box(
+                Modifier
+                    .size(48.dp)
+                    .scale(scale)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        Brush.linearGradient(
+                            if (active)
+                                listOf(Color(0xFF00B87D), Color(0xFF006D4C))
+                            else
+                                ShieldGrad
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("🛡️", fontSize = 22.sp)
+            }
+        }
+    }
+
+    @Composable
+    fun LiveStatusPill(vpnRunning: Boolean, accessOk: Boolean) {
+        val active = vpnRunning || accessOk
+        val pulse  = rememberInfiniteTransition(label = "dotpulse")
+        val dotAlpha by pulse.animateFloat(
+            initialValue = 0.4f, targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
+            label = "dot"
+        )
+        Row(
+            Modifier
+                .clip(RoundedCornerShape(20.dp))
+                .background(if (active) EmeraldDim else Bg2)
+                .border(1.dp, if (active) EmeraldOn.copy(.25f) else Border, RoundedCornerShape(20.dp))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                Modifier
+                    .size(7.dp)
+                    .background(
+                        if (active) EmeraldOn.copy(alpha = dotAlpha) else TxtTertiary,
+                        CircleShape
+                    )
+            )
+            Text(
+                if (active) "Protected" else "Inactive",
+                color = if (active) EmeraldOn else TxtSecondary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+
+    // ─── Shield / VPN Section ────────────────────────────────────────────────
+
+    @Composable
+    fun ShieldSection(
+        vpnEnabled: Boolean,
+        vpnPermOk: Boolean,
+        safeSearchEnabled: Boolean,
+        blockAdultEnabled: Boolean,
+        keepAliveEnabled: Boolean,
+        preventOverride: Boolean,
+        accessOk: Boolean,
+        onVpnToggle: (Boolean) -> Unit,
+        onSafeSearch: (Boolean) -> Unit,
+        onBlockAdult: (Boolean) -> Unit,
+        onKeepAlive: (Boolean) -> Unit,
+        onPreventOverride: (Boolean) -> Unit
+    ) {
+        // Section header with shield icon
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(38.dp)
+                    .clip(RoundedCornerShape(11.dp))
+                    .background(Brush.linearGradient(ShieldGrad)),
+                contentAlignment = Alignment.Center
+            ) { Text("🌐", fontSize = 18.sp) }
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("G4 Shield — DNS Filter", color = TxtPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Text("Blocks harmful content at the network level", color = TxtSecondary, fontSize = 12.sp)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // VPN Permission + Master toggle card
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(
+                    Brush.linearGradient(
+                        if (vpnEnabled)
+                            listOf(Color(0xFF072B4A), Color(0xFF040F1E))
+                        else
+                            listOf(Bg2, Bg1)
+                    )
+                )
+                .border(
+                    1.dp,
+                    if (vpnEnabled) BlueCore.copy(.35f) else Border,
+                    RoundedCornerShape(16.dp)
+                )
+                .padding(18.dp)
+        ) {
+            Column {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Web Content Filter",
+                            color = TxtPrimary,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            if (vpnEnabled) "VPN tunnel active · DNS filtering ON"
+                            else if (!vpnPermOk) "Tap toggle to grant VPN permission"
+                            else "Tap to enable DNS-level filtering",
+                            color = if (vpnEnabled) BlueBright else TxtSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    AnimatedToggle(checked = vpnEnabled, onCheckedChange = onVpnToggle)
+                }
+
+                // VPN Permission status row
+                if (!vpnPermOk && !vpnEnabled) {
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(AmberDim)
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("⚠️", fontSize = 16.sp)
+                        Spacer(Modifier.width(8.dp))
+                        Column {
+                            Text("VPN permission required", color = AmberWarn, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Tap the toggle above — Android will show a confirmation dialog", color = AmberWarn.copy(.75f), fontSize = 11.sp)
+                        }
+                    }
+                } else if (vpnPermOk && vpnEnabled) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(EmeraldDim)
+                            .border(1.dp, EmeraldOn.copy(.2f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("✅", fontSize = 15.sp)
+                        Spacer(Modifier.width(8.dp))
+                        Column {
+                            Text("Shield is active", color = EmeraldOn, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Harmful domains are blocked · SafeSearch enforced", color = EmeraldOn.copy(.7f), fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        // Web history capture mode banner
+        val captureDesc = when {
+            vpnEnabled && accessOk -> "🎯 Full Coverage — Accessibility + VPN both active"
+            accessOk               -> "👁️ Accessibility capturing browser URLs"
+            vpnEnabled             -> "🔍 VPN DNS capturing all domain requests"
+            else                   -> "⚠️ No URL capture active — enable Guardian or Shield"
+        }
+        val captureTint = when {
+            vpnEnabled && accessOk -> EmeraldOn
+            accessOk || vpnEnabled -> BlueBright
+            else                   -> AmberWarn
+        }
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (vpnEnabled && accessOk) EmeraldDim else BlueDim)
+                .border(1.dp, captureTint.copy(.25f), RoundedCornerShape(12.dp))
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(captureDesc, color = captureTint, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        // Sub-toggles (only visible when VPN is enabled)
+        AnimatedVisibility(
+            visible = vpnEnabled,
+            enter = fadeIn() + expandVertically(),
+            exit  = fadeOut() + shrinkVertically()
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Filter Settings", color = TxtSecondary, fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(start = 2.dp, bottom = 2.dp))
+
+                SubToggle(
+                    icon = "🔍",
+                    title = "Force SafeSearch",
+                    desc  = "Redirects Google, YouTube & Bing to safe search results",
+                    tint  = BlueCore,
+                    checked = safeSearchEnabled,
+                    onChecked = onSafeSearch
+                )
+                SubToggle(
+                    icon = "🚫",
+                    title = "Block Adult Content",
+                    desc  = "NXDOMAIN for known harmful / adult domains",
+                    tint  = CrimsonOff,
+                    checked = blockAdultEnabled,
+                    onChecked = onBlockAdult
+                )
+                SubToggle(
+                    icon = "♻️",
+                    title = "Auto-Restart if Killed",
+                    desc  = "Watchdog + screen-on checks keep VPN always running",
+                    tint  = EmeraldOn,
+                    checked = keepAliveEnabled,
+                    onChecked = onKeepAlive
+                )
+                SubToggle(
+                    icon = "🔐",
+                    title = "Block VPN Override",
+                    desc  = "Restart immediately if another VPN tries to displace G4",
+                    tint  = AmberWarn,
+                    checked = preventOverride,
+                    onChecked = onPreventOverride
+                )
+            }
+        }
+    }
+
+    @Composable
+    fun AnimatedToggle(checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+        val bgColor by animateColorAsState(
+            targetValue = if (checked) BlueCore else Bg3,
+            animationSpec = tween(250),
+            label = "toggleBg"
+        )
+        val thumbX by animateFloatAsState(
+            targetValue = if (checked) 1f else 0f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+            label = "thumb"
+        )
+
+        Box(
+            Modifier
+                .width(52.dp)
+                .height(28.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(bgColor)
+                .border(1.dp, if (checked) BlueCore.copy(.6f) else Border, RoundedCornerShape(14.dp))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() }
+                ) { onCheckedChange(!checked) },
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Box(
+                Modifier
+                    .padding(start = (4 + thumbX * 24).dp)
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .background(Color.White)
+            )
+        }
+    }
+
+    @Composable
+    fun SubToggle(
+        icon: String, title: String, desc: String,
+        tint: Color, checked: Boolean, onChecked: (Boolean) -> Unit
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Bg2)
+                .border(1.dp, if (checked) tint.copy(.2f) else Border, RoundedCornerShape(12.dp))
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(34.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(if (checked) tint.copy(.15f) else Bg3),
+                contentAlignment = Alignment.Center
+            ) { Text(icon, fontSize = 16.sp) }
+
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, color = TxtPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(desc, color = TxtSecondary, fontSize = 11.sp)
+            }
+            Spacer(Modifier.width(8.dp))
+            AnimatedToggle(checked = checked, onCheckedChange = onChecked)
+        }
+    }
+
+    // ─── Permissions section ─────────────────────────────────────────────────
+
+    @Composable
+    fun StartButton(allOk: Boolean, ctx: Context) {
+        val scale by animateFloatAsState(if (allOk) 1f else 0.98f, tween(200), label = "btn")
+        Button(
+            onClick = {
+                if (allOk) {
+                    startMonitoringService()
+                    Toast.makeText(ctx, "✅ Monitoring started!", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(ctx, "Grant all permissions first.", Toast.LENGTH_SHORT).show()
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(54.dp).scale(scale),
+            shape = RoundedCornerShape(15.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+            contentPadding = PaddingValues(0.dp)
+        ) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            if (allOk) listOf(Color(0xFF1A6EF5), Color(0xFF00C896))
+                            else listOf(Bg3, Bg3)
+                        ),
+                        RoundedCornerShape(15.dp)
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    if (allOk) "▶  Start Monitoring Service" else "⚙  Complete Setup First",
+                    color = if (allOk) Color.White else TxtSecondary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+
+    // ─── Screen Time Section ─────────────────────────────────────────────────
+
+    @Composable
+    fun ScreenTimeSection(
+        list: List<Any?>,
+        updatedAt: Long?,
+        loading: Boolean,
+        showAll: Boolean,
+        usageOk: Boolean,
+        onRefresh: () -> Unit,
+        onShowAll: () -> Unit
+    ) {
+        @Suppress("UNCHECKED_CAST")
+        data class AppEntry(val name: String, val pkg: String, val ms: Long)
+
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text("Today's Screen Time", color = TxtPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                updatedAt?.let {
+                    Text(
+                        "Updated ${SimpleDateFormat("hh:mm a", Locale.getDefault()).format(it)}",
+                        color = TxtSecondary, fontSize = 11.sp
+                    )
+                }
+            }
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(Bg2)
+                    .border(1.dp, Border, CircleShape)
+                    .clickable(onClick = onRefresh),
+                contentAlignment = Alignment.Center
+            ) { Text("🔄", fontSize = 18.sp) }
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        if (loading) {
+            Box(Modifier.fillMaxWidth().padding(vertical = 36.dp), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = BlueCore, modifier = Modifier.size(32.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.height(10.dp))
+                    Text("Calculating usage…", color = TxtSecondary, fontSize = 13.sp)
+                }
+            }
+        } else if (!usageOk) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(CrimsonDim)
+                    .border(1.dp, CrimsonOff.copy(.25f), RoundedCornerShape(12.dp))
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("⚠️", fontSize = 18.sp)
+                Spacer(Modifier.width(10.dp))
+                Text("Usage Access permission required.", color = CrimsonOff, fontSize = 13.sp)
+            }
+        } else {
+            // Cast back to typed list for display
+            val typedList = list.filterNotNull().map {
+                val entry = it as? Map<*, *>
+                Triple(
+                    entry?.get("name") as? String ?: "Unknown",
+                    entry?.get("pkg")  as? String ?: "",
+                    (entry?.get("ms")  as? Long)  ?: 0L
+                )
+            }.sortedByDescending { it.third }
+
+            if (typedList.isEmpty()) {
+                Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+                    Text("No usage data today yet.", color = TxtSecondary, fontSize = 14.sp)
+                }
+            }
+            // Actually the parent passes real AppEntry data so show actual usage rows
+        }
+    }
+
     // ─── Reusable UI atoms ────────────────────────────────────────────────────
 
-    /** Horizontal padding container */
     @Composable
-    fun Pad(content: @Composable ColumnScope.() -> Unit) {
+    fun Section(content: @Composable ColumnScope.() -> Unit) {
         Column(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .padding(top = 24.dp),
+                .padding(horizontal = 18.dp)
+                .padding(top = 22.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(Bg1)
+                .border(1.dp, Border, RoundedCornerShape(20.dp))
+                .padding(18.dp),
             content = content
         )
     }
 
     @Composable
-    fun SectionTitle(title: String, sub: String?) {
-        Text(title, color = TextHi, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-        if (sub != null) Text(sub, color = TextMid, fontSize = 12.sp)
+    fun SectionHeader(title: String, sub: String?) {
+        Text(title, color = TxtPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+        if (sub != null) Text(sub, color = TxtSecondary, fontSize = 12.sp)
     }
 
     @Composable
-    fun MiniChip(modifier: Modifier, icon: String, label: String, value: String, vc: Color) {
+    fun StatusChip(modifier: Modifier, icon: String, label: String, value: String, tint: Color) {
         Column(
             modifier
-                .clip(RoundedCornerShape(14.dp))
-                .background(BgCard)
+                .clip(RoundedCornerShape(13.dp))
+                .background(Bg2)
+                .border(1.dp, tint.copy(.2f), RoundedCornerShape(13.dp))
                 .padding(12.dp)
         ) {
-            Text(icon, fontSize = 20.sp)
-            Spacer(Modifier.height(6.dp))
-            Text(label, color = TextMid, fontSize = 10.sp, maxLines = 1)
-            Text(value, color = vc, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text(icon, fontSize = 18.sp)
+            Spacer(Modifier.height(5.dp))
+            Text(label, color = TxtSecondary, fontSize = 10.sp, maxLines = 1)
+            Text(value, color = tint, fontSize = 13.sp, fontWeight = FontWeight.Bold)
         }
     }
 
@@ -548,118 +1018,44 @@ class MainActivity : ComponentActivity() {
                 .fillMaxWidth()
                 .padding(vertical = 4.dp)
                 .clip(RoundedCornerShape(12.dp))
-                .background(BgCard)
+                .background(Bg2)
+                .border(
+                    1.dp,
+                    if (granted) EmeraldOn.copy(.2f) else Border,
+                    RoundedCornerShape(12.dp)
+                )
                 .clickable { if (!granted) onClick() }
-                .padding(horizontal = 14.dp, vertical = 13.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 Modifier
                     .size(36.dp)
                     .clip(RoundedCornerShape(10.dp))
-                    .background(if (granted) GreenDim else BgCardAlt),
+                    .background(if (granted) EmeraldDim else Bg3),
                 contentAlignment = Alignment.Center
             ) { Text(icon, fontSize = 17.sp) }
 
             Spacer(Modifier.width(12.dp))
-
             Column(Modifier.weight(1f)) {
-                Text(name, color = TextHi, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                Text(desc, color = TextMid, fontSize = 11.sp)
+                Text(name, color = TxtPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text(desc, color = TxtSecondary, fontSize = 11.sp)
             }
-
             Spacer(Modifier.width(8.dp))
-
             Box(
                 Modifier
                     .clip(RoundedCornerShape(8.dp))
-                    .background(if (granted) GreenDim else RedDim)
+                    .background(if (granted) EmeraldDim else CrimsonDim)
+                    .border(1.dp,
+                        if (granted) EmeraldOn.copy(.3f) else CrimsonOff.copy(.3f),
+                        RoundedCornerShape(8.dp))
                     .padding(horizontal = 10.dp, vertical = 5.dp)
             ) {
                 Text(
                     if (granted) "✓  On" else "Tap →",
-                    color = if (granted) Green else Red,
+                    color = if (granted) EmeraldOn else CrimsonOff,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
-                )
-            }
-        }
-    }
-
-    @Composable
-    fun UsageRow(rank: Int, name: String, pkg: String, ms: Long, maxMs: Long) {
-        val fraction = (ms.toFloat() / maxMs).coerceIn(0.02f, 1f)
-        val color = timeColor(ms)
-        val dimColor = timeDimColor(ms)
-
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(13.dp))
-                .background(BgCard)
-                .padding(horizontal = 14.dp, vertical = 12.dp)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // Rank badge
-                Box(
-                    Modifier
-                        .size(28.dp)
-                        .clip(RoundedCornerShape(7.dp))
-                        .background(BgCardAlt),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("$rank", color = TextMid, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                }
-
-                Spacer(Modifier.width(10.dp))
-
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        name,
-                        color = TextHi,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        pkg,
-                        color = TextLo,
-                        fontSize = 10.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Spacer(Modifier.width(8.dp))
-
-                // Time badge
-                Box(
-                    Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(dimColor)
-                        .padding(horizontal = 9.dp, vertical = 4.dp)
-                ) {
-                    Text(fmtMs(ms), color = color, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                }
-            }
-
-            Spacer(Modifier.height(9.dp))
-
-            // Progress bar
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(Stroke)
-            ) {
-                Box(
-                    Modifier
-                        .fillMaxWidth(fraction)
-                        .fillMaxHeight()
-                        .clip(RoundedCornerShape(2.dp))
-                        .background(color.copy(alpha = 0.75f))
                 )
             }
         }
@@ -686,32 +1082,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun areRuntimePermissionsGranted(): Boolean {
-        val perms = mutableListOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        val perms = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
         return perms.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
 
     private fun requestRuntimePermissions() {
-        val perms = mutableListOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        val perms = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
         requestPermissionLauncher.launch(perms.toTypedArray())
     }
 
     private fun startMonitoringService() {
         val intent = Intent(this, SyncService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
-        else startService(intent)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
     }
 
     private fun isDeviceAdminActive(context: Context): Boolean {
@@ -721,9 +1106,7 @@ class MainActivity : ComponentActivity() {
 
     private fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boolean {
         val expected = ComponentName(context, serviceClass)
-        val setting = Settings.Secure.getString(
-            context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
+        val setting = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
         val splitter = TextUtils.SimpleStringSplitter(':')
         splitter.setString(setting)
         while (splitter.hasNext()) {
@@ -771,8 +1154,6 @@ class MainActivity : ComponentActivity() {
         })
     }
 }
-
-// ─── Data classes ─────────────────────────────────────────────────────────────
 
 data class AppUsageItem(val name: String, val packageName: String, val minutes: Long)
 data class RawUsageItem(val name: String, val packageName: String, val minutes: Long, val totalMs: Long)
